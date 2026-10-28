@@ -963,7 +963,12 @@ function findNestedKey(obj, targetKey) {
   return null;
 }
 
-async function trySource1YtmTimedLyrics(videoId, preFetchedBrowseId = '', signal = null) {
+async function trySource1YtmTimedLyrics(
+  videoId,
+  preFetchedBrowseId = '',
+  signal = null,
+  titleVariants = []
+) {
   if (!videoId && !preFetchedBrowseId) return null;
 
   await ensureDeclarativeNetRequestRules();
@@ -998,6 +1003,27 @@ async function trySource1YtmTimedLyrics(videoId, preFetchedBrowseId = '', signal
 
       if (nextRes.ok) {
         const nextText = await nextRes.text();
+
+        // 자동재생 전환 직후 이전 곡의 videoId가 잘못 넘어왔는지 제목 교차 검증
+        if (Array.isArray(titleVariants) && titleVariants.length > 0) {
+          try {
+            const nextData = JSON.parse(nextText);
+            const panelVideo = findNestedKey(nextData, 'playlistPanelVideoRenderer');
+            const ytmTitle = panelVideo?.title?.runs?.[0]?.text || '';
+            if (ytmTitle) {
+              const titleSim = evaluateTitleSimilarity(ytmTitle, titleVariants);
+              const bothHaveHangul =
+                /[가-힣]/.test(ytmTitle) && titleVariants.some((v) => /[가-힣]/.test(v));
+              const bothAsciiOnly =
+                !/[^\x00-\x7F]/.test(ytmTitle) &&
+                titleVariants.every((v) => !/[^\x00-\x7F]/.test(v));
+              if (titleSim === 0 && (bothHaveHangul || bothAsciiOnly)) {
+                return null;
+              }
+            }
+          } catch (e) {}
+        }
+
         const browseIdMatch = nextText.match(/"browseId"\s*:\s*"(MPLYt_[^"]+)"/);
         if (browseIdMatch) {
           lyricsBrowseId = browseIdMatch[1];
@@ -1761,23 +1787,37 @@ async function fetchLyricsPipeline(meta) {
   // 1. 영구 로컬 캐시(좋아요/저장목록 곡) 또는 현재 세션 캐시(프리페칭 포함) 즉시 히트 (0.01초!)
   if (isPersistentCacheEnabled && persistentLyricsCache.has(canonicalKey)) {
     const pCached = persistentLyricsCache.get(canonicalKey);
-    const verified = validateAndCleanLyricsLanguage(
-      pCached.syncedLyrics,
-      langProfile,
-      pCached.sourceStage
-    );
-    if (verified) {
-      if (meta.videoId && !pCached.videoId) {
-        saveToPersistentStorage(canonicalKey, { ...pCached, syncedLyrics: verified }, meta);
+    const isStaleYtmVidMismatch =
+      pCached.sourceStage === 'ytm_timed_lyrics' &&
+      pCached.videoId &&
+      meta.videoId &&
+      pCached.videoId !== meta.videoId;
+
+    if (!isStaleYtmVidMismatch) {
+      const verified = validateAndCleanLyricsLanguage(
+        pCached.syncedLyrics,
+        langProfile,
+        pCached.sourceStage
+      );
+      if (verified) {
+        if (meta.videoId && !pCached.videoId) {
+          saveToPersistentStorage(canonicalKey, { ...pCached, syncedLyrics: verified }, meta);
+        }
+        return { ...pCached, syncedLyrics: verified, fromCache: true, fromPersistent: true };
       }
-      return { ...pCached, syncedLyrics: verified, fromCache: true, fromPersistent: true };
     }
     persistentLyricsCache.delete(canonicalKey);
   }
 
   if (sessionLyricsCache.has(canonicalKey)) {
     const cached = sessionLyricsCache.get(canonicalKey);
-    if (cached.status === 'synced') {
+    const isStaleYtmVidMismatch =
+      cached.sourceStage === 'ytm_timed_lyrics' &&
+      cached.videoId &&
+      meta.videoId &&
+      cached.videoId !== meta.videoId;
+
+    if (cached.status === 'synced' && !isStaleYtmVidMismatch) {
       const verified = validateAndCleanLyricsLanguage(
         cached.syncedLyrics,
         langProfile,
@@ -1790,6 +1830,8 @@ async function fetchLyricsPipeline(meta) {
         }
         return { ...cleanCached, fromCache: true };
       }
+      sessionLyricsCache.delete(canonicalKey);
+    } else if (isStaleYtmVidMismatch) {
       sessionLyricsCache.delete(canonicalKey);
     } else if (meta.isPrefetch) {
       return { ...cached, fromCache: true };
@@ -1810,7 +1852,9 @@ async function fetchLyricsPipeline(meta) {
       // 5대 가사 서버를 동시에 출발!
       // 1군(Tier 1 - 원어 신뢰도 최상): YTM TimedLyrics, LRCLIB, 알송(Alsong)
       const tier1List = [
-        requireSyncedResult(trySource1YtmTimedLyrics(meta.videoId, meta.lyricsBrowseId, signal)),
+        requireSyncedResult(
+          trySource1YtmTimedLyrics(meta.videoId, meta.lyricsBrowseId, signal, titleVariants)
+        ),
         requireSyncedResult(
           trySource6LrclibPipeline(
             titleVariants,

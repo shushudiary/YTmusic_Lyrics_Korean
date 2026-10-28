@@ -53,6 +53,13 @@
     lastSyncCheckTime: 0,           // 고주사율 타이머 스로틀 시각
     lastUiTickTime: 0,              // 프로그레스 바 갱신 타임스탬프
     videoElement: null,             // <video> 참조
+    lastTrackVideoId: '',           // 직전 트랙의 videoId (자동재생 전환 시 이전 곡 videoId 오염 방지)
+    lastTrackDuration: 0,           // 직전 트랙의 duration (자동재생 전환 직후 재생바 길이 오염 방지)
+    trackTransitionTime: 0,         // 트랙 전환 발생 시각 (performance.now)
+    lastWatchdogTime: 0,            // syncLoop 내 자동재생 트랙 전환 워치독 타임스탬프
+    userSelectedLyricsTab: false,   // 사용자가 '가사' 탭을 열어둔 상태인지 여부 (자동재생 시 탭 풀림 방지)
+    fetchedWithVideoId: '',         // 현재 트랙 가사 검색 시 사용된 videoId
+    fetchedWithDuration: 0,         // 현재 트랙 가사 검색 시 사용된 duration
     requestSeq: 0,                  // 비동기 요청 시퀀스 번호
     retryTimer: null,               // 메타데이터 안정화 대기 타이머
     nativeLyricsPollTimer: null     // YTM 기본 가사 폴백 타이머
@@ -206,33 +213,193 @@
   }
 
   /**
-   * 현재 재생 중인 곡의 YouTube videoId 추출 (홈 화면 재생 시에도 #movie_player에서 100% 추출)
+   * 현재 활성화된 <video> 엘리먼트를 항상 최신 상태로 반환 및 이벤트 바인딩 보장
    */
-  function extractCurrentVideoId() {
-    // 1. HTML5 플레이어(#movie_player) 내부의 현재 재생 영상 링크에서 추출 (홈 화면에서도 항상 최신 유지됨)
+  function getActiveVideoElement() {
+    const current = STATE.videoElement;
+    if (current && current.isConnected && !current.ended) {
+      return current;
+    }
+
+    const activeVid =
+      document.querySelector('#movie_player video.html5-main-video') ||
+      document.querySelector('video.html5-main-video') ||
+      document.querySelector('video');
+
+    if (activeVid && STATE.videoElement !== activeVid) {
+      bindVideoElement(activeVid);
+    }
+    return activeVid || current || null;
+  }
+
+  /**
+   * 하단 재생바(ytmusic-player-bar)의 .time-info 및 #progress-bar 슬라이더에서
+   * 실제 표시 중인 경과 시간(cur)과 전체 길이(dur)를 추출
+   */
+  function readPlayerBarTimeState() {
+    let barCur = -1;
+    let barDur = 0;
+
+    const playerBar = document.querySelector('ytmusic-player-bar');
+    if (!playerBar) return { barCur, barDur };
+
+    const timeInfoEl = playerBar.querySelector('.time-info.ytmusic-player-bar');
+    if (timeInfoEl && timeInfoEl.textContent) {
+      const parts = timeInfoEl.textContent.split('/');
+      if (parts.length === 2) {
+        const parsedCur = parseTimeLabelToSeconds(parts[0].trim());
+        const parsedDur = parseTimeLabelToSeconds(parts[1].trim());
+        if (parsedCur >= 0) barCur = parsedCur;
+        if (parsedDur > 0) barDur = parsedDur;
+      }
+    }
+
+    const slider = playerBar.querySelector('tp-yt-paper-slider#progress-bar, #progress-bar');
+    if (slider) {
+      const valAttr = Number(slider.getAttribute('value') ?? slider.value);
+      const maxAttr = Number(
+        slider.getAttribute('aria-valuemax') ?? slider.getAttribute('max') ?? slider.max
+      );
+      if (barDur <= 0 && Number.isFinite(maxAttr) && maxAttr > 1) {
+        barDur = maxAttr;
+      }
+      if (barCur < 0 && Number.isFinite(valAttr) && valAttr >= 0) {
+        barCur = valAttr;
+      }
+    }
+
+    return { barCur, barDur };
+  }
+
+  /**
+   * 자동재생(Autoplay) 전환 직후 <video>의 currentTime이나 duration이
+   * 이전 곡의 끝부분(예: 240s/240s)에 잠시 머물러 있거나 NaN이 되는 현상을 보정하여
+   * 정확한 { cur, dur } 재생 상태를 반환
+   */
+  function getEffectivePlaybackState(video) {
+    const vid = video || getActiveVideoElement();
+    const { barCur, barDur } = readPlayerBarTimeState();
+    const inTransitionWindow =
+      STATE.trackTransitionTime > 0 && performance.now() - STATE.trackTransitionTime < 2200;
+
+    const videoDur =
+      vid && Number.isFinite(vid.duration) && vid.duration > 1 ? vid.duration : 0;
+
+    let dur = 0;
+    if (
+      inTransitionWindow &&
+      STATE.lastTrackDuration > 0 &&
+      Math.abs(videoDur - STATE.lastTrackDuration) < 0.6 &&
+      barDur > 0 &&
+      Math.abs(barDur - videoDur) > 1.5
+    ) {
+      // 자동재생 직후 <video>.duration이 아직 이전 곡 길이에 머물러 있는 경우 하단 바의 새 곡 길이 사용
+      dur = barDur;
+    } else if (videoDur > 0) {
+      dur = videoDur;
+    } else if (barDur > 0) {
+      dur = barDur;
+    } else {
+      dur = STATE.meta.duration || 0;
+    }
+
+    let cur =
+      vid && Number.isFinite(vid.currentTime) && vid.currentTime >= 0 ? vid.currentTime : 0;
+
+    if (inTransitionWindow) {
+      const isStuckAtPrevEnd =
+        cur > 4 &&
+        ((barCur >= 0 && barCur <= 3) ||
+          (STATE.lastTrackDuration > 0 && Math.abs(cur - STATE.lastTrackDuration) < 3.5) ||
+          (dur > 0 && cur >= dur - 1.5));
+
+      if (isStuckAtPrevEnd) {
+        cur = barCur >= 0 && barCur <= 3 ? barCur : 0;
+      }
+    } else if (cur === 0 && barCur > 0 && (!vid || vid.readyState < 2)) {
+      cur = barCur;
+    }
+
+    return { cur, dur };
+  }
+
+  /**
+   * 현재 재생 중인 곡의 YouTube videoId 추출
+   * - 자동재생(Autoplay) 시 URL(?v=...)이나 플레이어 큐 첫 번째 항목 링크가 이전 곡의 videoId를
+   *   그대로 유지하여 이전 곡 가사를 불러오는 버그를 원천 차단!
+   */
+  function extractCurrentVideoId(rawTitle = '') {
+    const normTargetTitle = rawTitle
+      ? sanitizeTrackTitle(rawTitle).toLowerCase().replace(/\s+/g, '')
+      : '';
+
+    // 1. 하단 플레이어 바(ytmusic-player-bar) 내부에 현재 곡 전용 watch?v= 링크가 있는 경우 최우선
+    const barLink = document.querySelector('ytmusic-player-bar a[href*="watch?v="]');
+    if (barLink) {
+      const href = barLink.getAttribute('href') || '';
+      const match = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+      if (match && match[1] && match[1] !== STATE.lastTrackVideoId) {
+        return match[1];
+      }
+    }
+
+    // 2. 현재 재생목록 큐(ytmusic-player-queue-item)에서 실제 재생 중(selected / playing)인 아이템 확인
+    const activeQueueItems = document.querySelectorAll(
+      'ytmusic-player-queue-item[play-button-state="playing"], ytmusic-player-queue-item[selected]'
+    );
+    for (const item of activeQueueItems) {
+      const itemTitleEl = item.querySelector('.song-title');
+      const itemTitle = itemTitleEl ? itemTitleEl.textContent.trim() : '';
+      const normItemTitle = itemTitle
+        ? sanitizeTrackTitle(itemTitle).toLowerCase().replace(/\s+/g, '')
+        : '';
+
+      if (normTargetTitle && normItemTitle && normTargetTitle !== normItemTitle) {
+        continue;
+      }
+
+      const itemLink = item.querySelector('a[href*="watch?v="]');
+      if (itemLink) {
+        const href = itemLink.getAttribute('href') || '';
+        const match = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+        if (match && match[1] && match[1] !== STATE.lastTrackVideoId) {
+          return match[1];
+        }
+      }
+    }
+
+    // 3. HTML5 플레이어(#movie_player) 내부의 현재 재생 영상 링크에서 추출
+    //    단, 자동재생 전환 직후에는 이전 곡의 videoId가 남아 있을 수 있으므로 검증 후 채택!
     const ytpTitleLink = document.querySelector('#movie_player a.ytp-title-link[href*="watch?v="]');
     if (ytpTitleLink) {
       const href = ytpTitleLink.getAttribute('href') || '';
       const match = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-      if (match) return match[1];
+      if (match && match[1]) {
+        const candidateVid = match[1];
+        const linkTitle = (ytpTitleLink.textContent || '').trim();
+        const normLinkTitle = linkTitle
+          ? sanitizeTrackTitle(linkTitle).toLowerCase().replace(/\s+/g, '')
+          : '';
+
+        const titleMatches =
+          normTargetTitle &&
+          normLinkTitle &&
+          (normLinkTitle.includes(normTargetTitle) || normTargetTitle.includes(normLinkTitle));
+
+        if (candidateVid !== STATE.lastTrackVideoId || titleMatches) {
+          return candidateVid;
+        }
+      }
     }
 
-    // 2. URL 쿼리 파라미터(?v=...)에서 추출
+    // 4. URL 쿼리 파라미터(?v=...)에서 추출 (단, 이전 트랙의 videoId와 다를 때만 채택)
     try {
       const urlParams = new URLSearchParams(window.location.search);
       const fromUrl = urlParams.get('v');
-      if (fromUrl) return fromUrl;
+      if (fromUrl && fromUrl !== STATE.lastTrackVideoId) {
+        return fromUrl;
+      }
     } catch (e) {}
-
-    // 3. 플레이어 바 또는 플레이어 페이지 내부 링크에서 추출
-    const playerLink = document.querySelector(
-      'ytmusic-player-bar a[href*="watch?v="], ytmusic-player-page a[href*="watch?v="]'
-    );
-    if (playerLink) {
-      const href = playerLink.getAttribute('href') || '';
-      const match = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-      if (match) return match[1];
-    }
 
     return '';
   }
@@ -265,11 +432,7 @@
     const playerBar = document.querySelector('ytmusic-player-bar');
     if (!playerBar) return null;
 
-    const video =
-      document.querySelector('video.html5-main-video') || document.querySelector('video');
-    if (video && STATE.videoElement !== video) {
-      bindVideoElement(video);
-    }
+    const video = getActiveVideoElement();
 
     if (detectAdPlaying()) {
       return { isAd: true };
@@ -344,22 +507,11 @@
       coverUrl = coverUrl.replace(/=w\d+-h\d+[^&?]*/i, '=w1000-h1000-l95-rj');
     }
 
-    let duration = 0;
-    if (video && Number.isFinite(video.duration) && video.duration > 1) {
-      duration = video.duration;
-    } else {
-      const timeInfoEl = playerBar.querySelector('.time-info.ytmusic-player-bar');
-      if (timeInfoEl) {
-        const parts = timeInfoEl.textContent.split('/');
-        if (parts.length === 2) {
-          duration = parseTimeLabelToSeconds(parts[1].trim());
-        }
-      }
-    }
+    const { dur: duration } = getEffectivePlaybackState(video);
 
     const cleanTitle = sanitizeTrackTitle(rawTitle);
     const cleanArtist = sanitizeArtistName(rawArtist);
-    const videoId = extractCurrentVideoId();
+    const videoId = extractCurrentVideoId(rawTitle);
 
     return {
       isAd: false,
@@ -757,16 +909,37 @@
   }
 
   /**
-   * 초고주사율 동기화 루프 (50ms 주기 가사 이진 탐색 + 200ms 주기 Apple Music 프로그레스 바 갱신)
+   * 초고주사율 동기화 루프 (50ms 주기 가사 이진 탐색 + 150ms 주기 프로그레스 바 갱신 + 400ms 자동재생 워치독)
    */
   function syncLoop(timestamp) {
     STATE.rafId = requestAnimationFrame(syncLoop);
 
-    const video = STATE.videoElement || document.querySelector('video');
+    const video = getActiveVideoElement();
+
+    // 0. 자동재생(Autoplay) 전환 워치독 (400ms 주기):
+    //    MutationObserver가 연속적인 플레이어 바 이벤트나 백그라운드 전환으로 지연되더라도
+    //    곡 변경 및 지연 로드된 videoId/duration을 100% 즉시 감지!
+    if (timestamp - STATE.lastWatchdogTime >= 400) {
+      STATE.lastWatchdogTime = timestamp;
+      const playerBar = document.querySelector('ytmusic-player-bar');
+      if (playerBar) {
+        const titleEl =
+          playerBar.querySelector('yt-formatted-string.title.ytmusic-player-bar') ||
+          playerBar.querySelector('.title.ytmusic-player-bar');
+        const curRawTitle = titleEl ? titleEl.textContent.trim() : '';
+        if (
+          (curRawTitle && curRawTitle !== STATE.meta.rawTitle) ||
+          (!STATE.meta.videoId && curRawTitle)
+        ) {
+          handleDOMMutation();
+        }
+      }
+    }
+
     if (!video) return;
 
-    // 1. Apple Music 전체화면 모드가 열려 있을 때 좌측 프로그레스 시크바 및 경과/남은 시간 업데이트 (200ms 주기)
-    if (STATE.isAppleFullscreen && !STATE.isScrubbing && timestamp - STATE.lastUiTickTime >= 200) {
+    // 1. 좌측 프로그레스 시크바 및 경과/남은 시간 업데이트 (150ms 주기)
+    if (!STATE.isScrubbing && timestamp - STATE.lastUiTickTime >= 150) {
       STATE.lastUiTickTime = timestamp;
       updateProgressBarUI(video);
     }
@@ -781,7 +954,8 @@
     }
     STATE.lastSyncCheckTime = timestamp;
 
-    const effectiveTime = video.currentTime + STATE.offsetSec + 0.06;
+    const { cur } = getEffectivePlaybackState(video);
+    const effectiveTime = cur + STATE.offsetSec + 0.06;
     const newIndex = findActiveLineIndexBinarySearch(STATE.lyricsLines, effectiveTime);
 
     if (newIndex !== STATE.activeLineIndex) {
@@ -795,11 +969,10 @@
   function updateProgressBarUI(video) {
     if (!UI.scrubberFill || !UI.timeCurrentEl || !UI.timeRemainingEl) return;
 
-    const cur = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-    const dur =
-      Number.isFinite(video.duration) && video.duration > 0
-        ? video.duration
-        : STATE.meta.duration || 0;
+    const { cur, dur } = getEffectivePlaybackState(video);
+    if (dur > 0 && (!STATE.meta.duration || Math.abs(STATE.meta.duration - dur) > 2)) {
+      STATE.meta.duration = dur;
+    }
 
     const ratio = dur > 0 ? Math.min(1, Math.max(0, cur / dur)) : 0;
     UI.scrubberFill.style.width = `${(ratio * 100).toFixed(2)}%`;
@@ -1858,12 +2031,9 @@
 
     // 5. 프로그레스 바 클릭/드래그 시크(Seek)
     const seekFromPointer = (clientX) => {
-      const video = STATE.videoElement || document.querySelector('video');
+      const video = getActiveVideoElement();
       if (!video) return;
-      const dur =
-        Number.isFinite(video.duration) && video.duration > 0
-          ? video.duration
-          : STATE.meta.duration || 0;
+      const { dur } = getEffectivePlaybackState(video);
       if (dur <= 0) return;
 
       const rect = scrubberTrack.getBoundingClientRect();
@@ -2061,6 +2231,8 @@
 
   /**
    * 기존 #side-panel의 '가사' 탭 잠금 해제 및 선택 상태 동기화
+   * - 자동재생(Autoplay)으로 다음 곡에 넘어갈 때 YTM 내부 컨트롤러가 '가사' 탭을 강제로 비활성화하고
+   *   '다음 트랙' 탭으로 되돌려 가사창이 닫히는 현상을 방지!
    */
   function unlockAndSyncNativeLyricsTab(sidePanel) {
     const tabsContainer = sidePanel.querySelector('tp-yt-paper-tabs');
@@ -2083,9 +2255,17 @@
     if (UI.boundTabsContainer !== tabsContainer) {
       UI.boundTabsContainer = tabsContainer;
 
+      const initiallySelected =
+        lyricsTab.classList.contains('iron-selected') ||
+        lyricsTab.getAttribute('aria-selected') === 'true';
+      if (initiallySelected) {
+        STATE.userSelectedLyricsTab = true;
+      }
+
       lyricsTab.addEventListener(
         'click',
         () => {
+          STATE.userSelectedLyricsTab = true;
           sidePanel.classList.add('ytm-al-lyrics-tab-active');
           setTimeout(() => scrollToActiveLine(true), 50);
         },
@@ -2096,8 +2276,12 @@
         if (idx !== 1) {
           t.addEventListener(
             'click',
-            () => {
-              sidePanel.classList.remove('ytm-al-lyrics-tab-active');
+            (e) => {
+              // 사용자가 직접 마우스/키보드로 다른 탭('다음 트랙' 등)을 클릭한 경우에만 가사 탭 해제
+              if (e.isTrusted) {
+                STATE.userSelectedLyricsTab = false;
+                sidePanel.classList.remove('ytm-al-lyrics-tab-active');
+              }
             },
             true
           );
@@ -2105,9 +2289,28 @@
       });
     }
 
-    const isLyricsSelected =
+    let isLyricsSelected =
       lyricsTab.classList.contains('iron-selected') ||
       lyricsTab.getAttribute('aria-selected') === 'true';
+
+    // 사용자가 '가사' 탭을 열어둔 상태였는데 자동재생 전환 시 YTM이 강제로 탭 선택을 풀어버린 경우 즉시 복구!
+    if (STATE.userSelectedLyricsTab && !isLyricsSelected) {
+      tabs.forEach((t, idx) => {
+        const active = idx === 1;
+        t.classList.toggle('iron-selected', active);
+        t.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+      try {
+        if (typeof tabsContainer.select === 'function') {
+          tabsContainer.select(1);
+        } else {
+          tabsContainer.selected = 1;
+        }
+      } catch (e) {}
+      isLyricsSelected = true;
+    } else if (isLyricsSelected) {
+      STATE.userSelectedLyricsTab = true;
+    }
 
     sidePanel.classList.toggle('ytm-al-lyrics-tab-active', isLyricsSelected);
   }
@@ -2405,14 +2608,20 @@
     populateLyricsContainer(UI.tabLyricsContent, UI.tabLineElements);
 
     if (STATE.lyricsStatus === 'synced' && STATE.lyricsLines.length > 0) {
-      const video = STATE.videoElement || document.querySelector('video');
+      const video = getActiveVideoElement();
       if (video) {
+        const { cur } = getEffectivePlaybackState(video);
         const idx = findActiveLineIndexBinarySearch(
           STATE.lyricsLines,
-          video.currentTime + STATE.offsetSec + 0.06
+          cur + STATE.offsetSec + 0.06
         );
         updateActiveLyricLine(idx);
-        setTimeout(() => scrollToActiveLine(true), 60);
+        if (idx < 0) {
+          if (UI.lyricsViewport) UI.lyricsViewport.scrollTop = 0;
+          if (UI.tabLyricsViewport) UI.tabLyricsViewport.scrollTop = 0;
+        } else {
+          setTimeout(() => scrollToActiveLine(true), 60);
+        }
       }
     } else {
       if (UI.lyricsViewport) UI.lyricsViewport.scrollTop = 0;
@@ -2421,7 +2630,7 @@
   }
 
   function seekToLyricTime(timeSec) {
-    const video = STATE.videoElement || document.querySelector('video');
+    const video = getActiveVideoElement();
     if (!video || !Number.isFinite(timeSec)) return;
 
     const targetVideoTime = Math.max(0, timeSec - STATE.offsetSec);
@@ -2442,6 +2651,7 @@
    * ========================================================================== */
 
   function bindVideoElement(video) {
+    if (!video || STATE.videoElement === video) return;
     STATE.videoElement = video;
 
     const updatePlayState = () => {
@@ -2452,6 +2662,11 @@
     };
 
     video.addEventListener('play', updatePlayState);
+    video.addEventListener('playing', () => {
+      updatePlayState();
+      updateProgressBarUI(video);
+      handleDOMMutation();
+    });
     video.addEventListener('pause', updatePlayState);
     updatePlayState();
 
@@ -2459,21 +2674,40 @@
       UI.volumeSlider.value = video.muted ? '0' : String(Math.round(video.volume * 100));
     }
 
+    video.addEventListener('timeupdate', () => {
+      if (!STATE.isScrubbing) {
+        updateProgressBarUI(video);
+      }
+    });
+
     video.addEventListener('seeked', () => {
       updateProgressBarUI(video);
       if (STATE.lyricsStatus === 'synced') {
-        const effectiveTime = video.currentTime + STATE.offsetSec + 0.06;
+        const { cur } = getEffectivePlaybackState(video);
+        const effectiveTime = cur + STATE.offsetSec + 0.06;
         const idx = findActiveLineIndexBinarySearch(STATE.lyricsLines, effectiveTime);
         updateActiveLyricLine(idx);
       }
     });
 
+    video.addEventListener('loadeddata', () => {
+      updateProgressBarUI(video);
+      handleDOMMutation();
+    });
+
     video.addEventListener('loadedmetadata', () => {
+      updateProgressBarUI(video);
       handleDOMMutation();
     });
 
     video.addEventListener('durationchange', () => {
+      updateProgressBarUI(video);
       handleDOMMutation();
+    });
+
+    video.addEventListener('ended', () => {
+      setTimeout(() => handleDOMMutation(), 120);
+      setTimeout(() => handleDOMMutation(), 450);
     });
   }
 
@@ -2504,20 +2738,34 @@
         updatePlayerPageVisuals();
       }
 
-      let shouldRetrySynced = false;
+      let videoIdJustResolved = false;
+      let durationJustResolved = false;
+
       if (extracted.videoId && STATE.meta.videoId !== extracted.videoId) {
         STATE.meta.videoId = extracted.videoId;
-        shouldRetrySynced = true;
+        videoIdJustResolved = true;
       }
       if (extracted.duration > 0 && Math.abs(STATE.meta.duration - extracted.duration) > 2) {
         STATE.meta.duration = extracted.duration;
-        shouldRetrySynced = true;
+        durationJustResolved = true;
+        updateProgressBarUI(getActiveVideoElement());
       }
 
-      // 이전 요청 시점에 videoId나 duration이 아직 로드되지 않아 일반 가사(plain)나 not_found로 빠졌다면,
-      // 실제 videoId / duration이 로드되었을 때 즉시 실시간 싱크 가사를 다시 검색!
+      // 1) 자동재생 직후 videoId가 뒤늦게 갱신되었는데, 이전 검색이 다른 videoId로 수행되었거나 아직 싱크 가사를 못 찾은 경우 즉시 재요청!
       if (
-        shouldRetrySynced &&
+        videoIdJustResolved &&
+        STATE.fetchedWithVideoId !== extracted.videoId &&
+        (STATE.lyricsStatus !== 'synced' ||
+          (STATE.fetchedWithVideoId && STATE.currentSourceStage === 'ytm_timed_lyrics'))
+      ) {
+        STATE.meta.lyricsBrowseId = '';
+        requestMultiSourceLyrics(STATE.meta, { forceRefresh: true });
+        return;
+      }
+
+      // 2) 이전 요청 시점에 videoId나 duration이 아직 로드되지 않아 일반 가사(plain)나 not_found로 빠졌다면 즉시 재검색!
+      if (
+        (videoIdJustResolved || durationJustResolved) &&
         STATE.lyricsStatus !== 'synced' &&
         STATE.lyricsStatus !== 'loading'
       ) {
@@ -2537,6 +2785,7 @@
       return;
     }
 
+    // === 새로운 곡으로 전환됨 (수동 선택 또는 자동재생 전환) ===
     const currentDomNative = document.querySelector(
       'ytmusic-player-page #side-panel ytmusic-description-shelf-renderer .description'
     );
@@ -2544,21 +2793,48 @@
       ? (currentDomNative.innerText || currentDomNative.textContent || '').trim()
       : '';
 
+    if (STATE.meta && STATE.meta.videoId) {
+      STATE.lastTrackVideoId = STATE.meta.videoId;
+    }
+    if (STATE.meta && STATE.meta.duration > 0) {
+      STATE.lastTrackDuration = STATE.meta.duration;
+    }
+    STATE.trackTransitionTime = performance.now();
+    STATE.isScrubbing = false;
+
+    // 만약 방금 추출된 videoId가 이전 곡의 videoId와 동일하다면(자동재생 전환 직후 DOM 미갱신 상태) 비워둠
+    const safeInitialVideoId =
+      extracted.videoId && extracted.videoId !== STATE.lastTrackVideoId ? extracted.videoId : '';
+
     STATE.currentTrackKey = newTrackKey;
     STATE.preferredProviderKey = 'auto';
     STATE.currentSourceStage = '';
+    STATE.fetchedWithVideoId = safeInitialVideoId;
+    STATE.fetchedWithDuration = extracted.duration;
+
     STATE.meta = {
-      videoId: extracted.videoId,
+      videoId: safeInitialVideoId,
       rawTitle: extracted.rawTitle,
       cleanTitle: extracted.cleanTitle,
       rawArtist: extracted.rawArtist,
       cleanArtist: extracted.cleanArtist,
       album: extracted.album,
       coverUrl: extracted.coverUrl,
-      duration: extracted.duration
+      duration: extracted.duration,
+      lyricsBrowseId: '',
+      enTitle: '',
+      enArtist: ''
     };
 
     STATE.offsetSec = STATE.trackOffsets[newTrackKey] || 0.0;
+
+    // 프로그레스 바 즉시 0:00 (0%)으로 리셋 및 새 곡 길이 반영
+    if (UI.scrubberFill) UI.scrubberFill.style.width = '0%';
+    if (UI.timeCurrentEl) UI.timeCurrentEl.textContent = '0:00';
+    if (UI.timeRemainingEl) {
+      UI.timeRemainingEl.textContent = `-${formatSecondsToLabel(extracted.duration || 0)}`;
+    }
+    updateProgressBarUI(getActiveVideoElement());
 
     updatePlayerPageVisuals();
     requestMultiSourceLyrics(STATE.meta);
@@ -2994,13 +3270,23 @@
       const latest = extractTrackMetadata();
       const payload = latest && !latest.isAd ? latest : meta;
       const persistToStorage = isLikedOrSavedTrack();
+      const safeVid =
+        payload.videoId && payload.videoId !== STATE.lastTrackVideoId
+          ? payload.videoId
+          : STATE.meta.videoId && STATE.meta.videoId !== STATE.lastTrackVideoId
+            ? STATE.meta.videoId
+            : '';
+
       STATE.meta = {
         ...STATE.meta,
         ...payload,
+        videoId: safeVid,
         persistToStorage,
         preferredSource,
         forceRefresh
       };
+      STATE.fetchedWithVideoId = STATE.meta.videoId || '';
+      STATE.fetchedWithDuration = STATE.meta.duration || 0;
 
       if (UI.favBtn) {
         UI.favBtn.classList.toggle('is-active', persistToStorage);
@@ -3016,6 +3302,7 @@
         if (currentSeq !== STATE.requestSeq) return;
         if (ytmMetaPre.resolvedVideoId && !STATE.meta.videoId) {
           STATE.meta.videoId = ytmMetaPre.resolvedVideoId;
+          STATE.fetchedWithVideoId = ytmMetaPre.resolvedVideoId;
         }
         if (ytmMetaPre.lyricsBrowseId) {
           STATE.meta.lyricsBrowseId = ytmMetaPre.lyricsBrowseId;
@@ -3069,6 +3356,7 @@
       let hasNewYtmMeta = false;
       if (ytmMeta.resolvedVideoId && !STATE.meta.videoId) {
         STATE.meta.videoId = ytmMeta.resolvedVideoId;
+        STATE.fetchedWithVideoId = ytmMeta.resolvedVideoId;
         hasNewYtmMeta = true;
       }
       if (ytmMeta.lyricsBrowseId && STATE.meta.lyricsBrowseId !== ytmMeta.lyricsBrowseId) {
@@ -3231,11 +3519,42 @@
 
   function initObservers() {
     let debounceTimer = null;
-    const debouncedCheck = () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        handleDOMMutation();
-      }, 100);
+    let lastRunAt = 0;
+
+    const runMutationCheck = () => {
+      debounceTimer = null;
+      lastRunAt = performance.now();
+      handleDOMMutation();
+    };
+
+    const debouncedCheck = (mutations) => {
+      // 우리가 주입한 가사 컨테이너 내부의 50ms 클래스 토글(.is-active 등)로 인한 무한 디바운스 지연 방지
+      if (Array.isArray(mutations) && mutations.length > 0) {
+        const hasExternalMutation = mutations.some((m) => {
+          const target = m.target instanceof Element ? m.target : m.target?.parentElement;
+          if (!target) return true;
+          if (
+            target.closest(
+              '#ytm-apple-lyrics-integrated, #ytm-apple-music-fullscreen, .ytm-al-page-backdrop, .ytm-al-saved-note-badge'
+            )
+          ) {
+            return false;
+          }
+          return true;
+        });
+        if (!hasExternalMutation) return;
+      }
+
+      const now = performance.now();
+      if (now - lastRunAt >= 140) {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        runMutationCheck();
+        return;
+      }
+
+      if (!debounceTimer) {
+        debounceTimer = setTimeout(runMutationCheck, 100);
+      }
     };
 
     const observer = new MutationObserver(debouncedCheck);
