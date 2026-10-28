@@ -55,6 +55,9 @@
     videoElement: null,             // <video> 참조
     lastTrackVideoId: '',           // 직전 트랙의 videoId (자동재생 전환 시 이전 곡 videoId 오염 방지)
     lastTrackDuration: 0,           // 직전 트랙의 duration (자동재생 전환 직후 재생바 길이 오염 방지)
+    lockedTrackDuration: 0,         // 현재 트랙의 확정된 전체 길이 (곡 종료 직전 MSE 다음 곡 프리버퍼링으로 duration이 늘어나는 현상 차단)
+    lastBarCur: -1,                 // 하단 재생바(.time-info)의 마지막 초 단위 경과 시간
+    lastBarCurPerfTime: 0,          // 하단 재생바 초가 갱신된 시각 (MSE 오프셋 환경에서 60fps 밀리초 보간용)
     trackTransitionTime: 0,         // 트랙 전환 발생 시각 (performance.now)
     lastWatchdogTime: 0,            // syncLoop 내 자동재생 트랙 전환 워치독 타임스탬프
     userSelectedLyricsTab: false,   // 사용자가 '가사' 탭을 열어둔 상태인지 여부 (자동재생 시 탭 풀림 방지)
@@ -233,91 +236,175 @@
   }
 
   /**
-   * 하단 재생바(ytmusic-player-bar)의 .time-info 및 #progress-bar 슬라이더에서
-   * 실제 표시 중인 경과 시간(cur)과 전체 길이(dur)를 추출
+   * 하단 재생바(ytmusic-player-bar)의 .time-info, 재생목록 큐(.duration), #progress-bar에서
+   * MSE 버퍼 누적에 오염되지 않은 순수 트랙 기준 경과 시간(barCur)과 전체 길이(barDur, queueDur)를 추출
    */
-  function readPlayerBarTimeState() {
+  function readPlayerBarTimeState(targetRawTitle = '') {
     let barCur = -1;
     let barDur = 0;
+    let queueDur = 0;
 
     const playerBar = document.querySelector('ytmusic-player-bar');
-    if (!playerBar) return { barCur, barDur };
+    if (playerBar) {
+      const timeInfoEl = playerBar.querySelector('.time-info.ytmusic-player-bar');
+      if (timeInfoEl && timeInfoEl.textContent) {
+        const parts = timeInfoEl.textContent.split('/');
+        if (parts.length === 2) {
+          const parsedCur = parseTimeLabelToSeconds(parts[0].trim());
+          const parsedDur = parseTimeLabelToSeconds(parts[1].trim());
+          if (parsedCur >= 0) barCur = parsedCur;
+          if (parsedDur > 0) barDur = parsedDur;
+        }
+      }
 
-    const timeInfoEl = playerBar.querySelector('.time-info.ytmusic-player-bar');
-    if (timeInfoEl && timeInfoEl.textContent) {
-      const parts = timeInfoEl.textContent.split('/');
-      if (parts.length === 2) {
-        const parsedCur = parseTimeLabelToSeconds(parts[0].trim());
-        const parsedDur = parseTimeLabelToSeconds(parts[1].trim());
-        if (parsedCur >= 0) barCur = parsedCur;
-        if (parsedDur > 0) barDur = parsedDur;
+      if (barCur < 0 || barDur <= 0) {
+        const slider = playerBar.querySelector('tp-yt-paper-slider#progress-bar, #progress-bar');
+        if (slider) {
+          const valAttr = Number(
+            slider.getAttribute('aria-valuenow') ?? slider.getAttribute('value') ?? slider.value
+          );
+          const maxAttr = Number(
+            slider.getAttribute('aria-valuemax') ?? slider.getAttribute('max') ?? slider.max
+          );
+          if (barDur <= 0 && Number.isFinite(maxAttr) && maxAttr > 1) {
+            barDur = maxAttr;
+          }
+          if (barCur < 0 && Number.isFinite(valAttr) && valAttr >= 0) {
+            barCur = valAttr;
+          }
+        }
       }
     }
 
-    const slider = playerBar.querySelector('tp-yt-paper-slider#progress-bar, #progress-bar');
-    if (slider) {
-      const valAttr = Number(slider.getAttribute('value') ?? slider.value);
-      const maxAttr = Number(
-        slider.getAttribute('aria-valuemax') ?? slider.getAttribute('max') ?? slider.max
-      );
-      if (barDur <= 0 && Number.isFinite(maxAttr) && maxAttr > 1) {
-        barDur = maxAttr;
+    // 현재 재생 중인 큐 아이템(ytmusic-player-queue-item)에 표시된 정적 곡 길이(.duration) 추출
+    // (이 값은 카탈로그 정적 메타데이터이므로 MSE 버퍼 병합으로 인해 곡이 끝나기 몇 초 전에 절대 늘어나지 않음!)
+    const refTitle = targetRawTitle || STATE.meta.rawTitle || '';
+    const normRefTitle = refTitle
+      ? sanitizeTrackTitle(refTitle).toLowerCase().replace(/\s+/g, '')
+      : '';
+
+    const activeQueueItems = document.querySelectorAll(
+      'ytmusic-player-queue-item[play-button-state="playing"], ytmusic-player-queue-item[selected]'
+    );
+    for (const item of activeQueueItems) {
+      const itemTitleEl = item.querySelector('.song-title');
+      const itemTitle = itemTitleEl ? itemTitleEl.textContent.trim() : '';
+      const normItemTitle = itemTitle
+        ? sanitizeTrackTitle(itemTitle).toLowerCase().replace(/\s+/g, '')
+        : '';
+
+      if (normRefTitle && normItemTitle && normRefTitle !== normItemTitle) {
+        continue;
       }
-      if (barCur < 0 && Number.isFinite(valAttr) && valAttr >= 0) {
-        barCur = valAttr;
+
+      const durEl = item.querySelector('.duration');
+      if (durEl && durEl.textContent) {
+        const parsedQueueDur = parseTimeLabelToSeconds(durEl.textContent.trim());
+        if (parsedQueueDur > 0) {
+          queueDur = parsedQueueDur;
+          break;
+        }
       }
     }
 
-    return { barCur, barDur };
+    return { barCur, barDur, queueDur };
   }
 
   /**
-   * 자동재생(Autoplay) 전환 직후 <video>의 currentTime이나 duration이
-   * 이전 곡의 끝부분(예: 240s/240s)에 잠시 머물러 있거나 NaN이 되는 현상을 보정하여
-   * 정확한 { cur, dur } 재생 상태를 반환
+   * YouTube Music의 Gapless Playback(MSE 연속 버퍼 병합) 대응 재생 시간·길이 보정 엔진:
+   * 1) 곡이 끝나기 몇 초 전에 YTM이 다음 곡 오디오를 MSE 버퍼에 이어붙여 <video>.duration이 갑자기 2배로 늘어날 때,
+   *    현재 곡의 확정된 길이(STATE.lockedTrackDuration / queueDur / barDur)를 유지하여 남은 시간 공간이 늘어나는 현상을 100% 차단!
+   * 2) 자동재생으로 다음 곡에 넘어간 뒤 <video>.currentTime이 0으로 리셋되지 않고 이전 곡 끝 시간(예: 180s -> 182.2s...)에서
+   *    계속 누적 증가하더라도, 곡 전체 구간 동안 하단 재생바 시간(barCur) + 60fps 밀리초 보간값을 사용하여
+   *    재생바가 이상해지거나 가사가 맨 뒤로 점프하는 현상을 원천 차단!
    */
-  function getEffectivePlaybackState(video) {
+  function getEffectivePlaybackState(video, targetRawTitle = '') {
     const vid = video || getActiveVideoElement();
-    const { barCur, barDur } = readPlayerBarTimeState();
-    const inTransitionWindow =
-      STATE.trackTransitionTime > 0 && performance.now() - STATE.trackTransitionTime < 2200;
+    const { barCur, barDur, queueDur } = readPlayerBarTimeState(targetRawTitle);
+    const now = performance.now();
+    const justTransitioned =
+      STATE.trackTransitionTime > 0 && now - STATE.trackTransitionTime < 1600;
 
     const videoDur =
       vid && Number.isFinite(vid.duration) && vid.duration > 1 ? vid.duration : 0;
+    const videoCur =
+      vid && Number.isFinite(vid.currentTime) && vid.currentTime >= 0 ? vid.currentTime : 0;
 
+    // 1. 트랙 전환 직후 1.6초 이내에 하단 .time-info가 아직 이전 곡의 끝 시간(예: 3:00 / 3:00)에 머물러 있는지 판별
+    let effectiveBarCur = barCur;
+    if (justTransitioned && effectiveBarCur > 4) {
+      const stuckAtPrevDuration =
+        (STATE.lastTrackDuration > 0 && Math.abs(effectiveBarCur - STATE.lastTrackDuration) <= 5) ||
+        (barDur > 0 && effectiveBarCur >= barDur - 3);
+      if (stuckAtPrevDuration) {
+        effectiveBarCur = 0;
+      }
+    }
+
+    // 2. 전체 길이(dur) 산출 및 고정(Lock):
+    //    한 번 현재 트랙의 고유 길이가 확정되면, 곡이 끝나기 몇 초 전에 MSE가 다음 곡을 프리버퍼링해
+    //    video.duration 등이 갑자기 늘어나더라도 절대 길이가 변하지 않도록 고정!
     let dur = 0;
-    if (
-      inTransitionWindow &&
-      STATE.lastTrackDuration > 0 &&
-      Math.abs(videoDur - STATE.lastTrackDuration) < 0.6 &&
-      barDur > 0 &&
-      Math.abs(barDur - videoDur) > 1.5
-    ) {
-      // 자동재생 직후 <video>.duration이 아직 이전 곡 길이에 머물러 있는 경우 하단 바의 새 곡 길이 사용
-      dur = barDur;
-    } else if (videoDur > 0) {
-      dur = videoDur;
+    if (STATE.lockedTrackDuration > 0) {
+      if (
+        queueDur > 0 &&
+        Math.abs(queueDur - STATE.lockedTrackDuration) > 2 &&
+        STATE.lockedTrackDuration === STATE.lastTrackDuration
+      ) {
+        STATE.lockedTrackDuration = queueDur;
+      }
+      dur = STATE.lockedTrackDuration;
+    } else if (queueDur > 0) {
+      STATE.lockedTrackDuration = queueDur;
+      dur = queueDur;
     } else if (barDur > 0) {
+      const isFreshBarDur =
+        !justTransitioned ||
+        barDur !== STATE.lastTrackDuration ||
+        (effectiveBarCur >= 0 && effectiveBarCur <= 3);
+      if (isFreshBarDur) {
+        STATE.lockedTrackDuration = barDur;
+      }
       dur = barDur;
+    } else if (
+      videoDur > 0 &&
+      (!justTransitioned || Math.abs(videoDur - STATE.lastTrackDuration) > 1.5)
+    ) {
+      dur = videoDur;
     } else {
       dur = STATE.meta.duration || 0;
     }
 
-    let cur =
-      vid && Number.isFinite(vid.currentTime) && vid.currentTime >= 0 ? vid.currentTime : 0;
-
-    if (inTransitionWindow) {
-      const isStuckAtPrevEnd =
-        cur > 4 &&
-        ((barCur >= 0 && barCur <= 3) ||
-          (STATE.lastTrackDuration > 0 && Math.abs(cur - STATE.lastTrackDuration) < 3.5) ||
-          (dur > 0 && cur >= dur - 1.5));
-
-      if (isStuckAtPrevEnd) {
-        cur = barCur >= 0 && barCur <= 3 ? barCur : 0;
+    // 3. 현재 경과 시간(cur) 산출 (곡 시작부터 끝까지 상시 MSE 오프셋 보정 + 60fps 밀리초 보간):
+    let cur = 0;
+    if (effectiveBarCur >= 0) {
+      if (effectiveBarCur !== STATE.lastBarCur) {
+        STATE.lastBarCur = effectiveBarCur;
+        STATE.lastBarCurPerfTime = now;
       }
-    } else if (cur === 0 && barCur > 0 && (!vid || vid.readyState < 2)) {
-      cur = barCur;
+      const isPlaying = vid ? !vid.paused : !STATE.isVideoPaused;
+      const subSec =
+        isPlaying && STATE.lastBarCurPerfTime > 0
+          ? Math.min(0.98, Math.max(0, (now - STATE.lastBarCurPerfTime) / 1000))
+          : 0;
+      const smoothBarCur = effectiveBarCur + subSec;
+
+      // <video>.currentTime이 하단 재생바 시간과 1.5초 이내로 일치할 때만 <video>.currentTime을 사용하고,
+      // MSE 연속 재생으로 인해 <video>.currentTime이 이전 곡 길이만큼 누적(예: 182.2초 vs 실제 2.2초)되어 있으면
+      // 곡이 끝날 때까지 내내 smoothBarCur를 사용하여 가사가 맨 뒤로 점프하는 현상을 완벽히 방지!
+      if (!justTransitioned && Math.abs(videoCur - smoothBarCur) <= 1.5) {
+        cur = videoCur;
+      } else {
+        cur = smoothBarCur;
+      }
+    } else {
+      cur = justTransitioned && videoCur > 4 ? 0 : videoCur;
+    }
+
+    if (dur > 0) {
+      cur = Math.min(dur, Math.max(0, cur));
+    } else {
+      cur = Math.max(0, cur);
     }
 
     return { cur, dur };
@@ -507,7 +594,26 @@
       coverUrl = coverUrl.replace(/=w\d+-h\d+[^&?]*/i, '=w1000-h1000-l95-rj');
     }
 
-    const { dur: duration } = getEffectivePlaybackState(video);
+    const candidateTrackKey = `${rawTitle}:::${rawArtist}`;
+    if (
+      STATE.currentTrackKey &&
+      STATE.currentTrackKey !== '__AD_PLAYING__' &&
+      candidateTrackKey !== STATE.currentTrackKey
+    ) {
+      if (STATE.meta && STATE.meta.videoId) {
+        STATE.lastTrackVideoId = STATE.meta.videoId;
+      }
+      const prevDur = STATE.lockedTrackDuration || (STATE.meta && STATE.meta.duration) || 0;
+      if (prevDur > 0) {
+        STATE.lastTrackDuration = prevDur;
+      }
+      STATE.lockedTrackDuration = 0;
+      STATE.trackTransitionTime = performance.now();
+      STATE.lastBarCur = 0;
+      STATE.lastBarCurPerfTime = performance.now();
+    }
+
+    const { dur: duration } = getEffectivePlaybackState(video, rawTitle);
 
     const cleanTitle = sanitizeTrackTitle(rawTitle);
     const cleanArtist = sanitizeArtistName(rawArtist);
@@ -528,7 +634,9 @@
 
   function parseTimeLabelToSeconds(label) {
     if (!label) return 0;
-    const nums = label.split(':').map((n) => parseInt(n.trim(), 10));
+    const cleaned = String(label).replace(/[^\d:]/g, '').trim();
+    if (!cleaned) return 0;
+    const nums = cleaned.split(':').map((n) => parseInt(n.trim(), 10));
     if (nums.some((n) => Number.isNaN(n))) return 0;
     if (nums.length === 2) return nums[0] * 60 + nums[1];
     if (nums.length === 3) return nums[0] * 3600 + nums[1] * 60 + nums[2];
@@ -970,7 +1078,7 @@
     if (!UI.scrubberFill || !UI.timeCurrentEl || !UI.timeRemainingEl) return;
 
     const { cur, dur } = getEffectivePlaybackState(video);
-    if (dur > 0 && (!STATE.meta.duration || Math.abs(STATE.meta.duration - dur) > 2)) {
+    if (dur > 0 && (!STATE.meta.duration || STATE.meta.duration === STATE.lastTrackDuration)) {
       STATE.meta.duration = dur;
     }
 
@@ -2029,16 +2137,21 @@
       });
     });
 
-    // 5. 프로그레스 바 클릭/드래그 시크(Seek)
+    // 5. 프로그레스 바 클릭/드래그 시크(Seek) (MSE 연속 재생 오프셋 완벽 대응)
     const seekFromPointer = (clientX) => {
       const video = getActiveVideoElement();
       if (!video) return;
-      const { dur } = getEffectivePlaybackState(video);
+      const { cur, dur } = getEffectivePlaybackState(video);
       if (dur <= 0) return;
 
       const rect = scrubberTrack.getBoundingClientRect();
       const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-      video.currentTime = ratio * dur;
+      const targetTrackSec = ratio * dur;
+      const deltaSec = targetTrackSec - cur;
+
+      video.currentTime = Math.max(0, (Number.isFinite(video.currentTime) ? video.currentTime : 0) + deltaSec);
+      STATE.lastBarCur = Math.floor(targetTrackSec);
+      STATE.lastBarCurPerfTime = performance.now();
       updateProgressBarUI(video);
     };
 
@@ -2376,9 +2489,10 @@
 
     updateOffsetDisplay();
 
-    const video = STATE.videoElement || document.querySelector('video');
+    const video = getActiveVideoElement();
     if (STATE.lyricsStatus === 'synced' && video) {
-      const effectiveTime = video.currentTime + STATE.offsetSec + 0.06;
+      const { cur } = getEffectivePlaybackState(video);
+      const effectiveTime = cur + STATE.offsetSec + 0.06;
       const newIndex = findActiveLineIndexBinarySearch(STATE.lyricsLines, effectiveTime);
       updateActiveLyricLine(newIndex);
     }
@@ -2633,8 +2747,16 @@
     const video = getActiveVideoElement();
     if (!video || !Number.isFinite(timeSec)) return;
 
-    const targetVideoTime = Math.max(0, timeSec - STATE.offsetSec);
-    video.currentTime = targetVideoTime;
+    const targetTrackTime = Math.max(0, timeSec - STATE.offsetSec);
+    const { cur } = getEffectivePlaybackState(video);
+    const deltaSec = targetTrackTime - cur;
+
+    video.currentTime = Math.max(
+      0,
+      (Number.isFinite(video.currentTime) ? video.currentTime : 0) + deltaSec
+    );
+    STATE.lastBarCur = Math.floor(targetTrackTime);
+    STATE.lastBarCurPerfTime = performance.now();
 
     if (video.paused) {
       video.play().catch(() => {});
@@ -2745,7 +2867,10 @@
         STATE.meta.videoId = extracted.videoId;
         videoIdJustResolved = true;
       }
-      if (extracted.duration > 0 && Math.abs(STATE.meta.duration - extracted.duration) > 2) {
+      if (
+        extracted.duration > 0 &&
+        (!STATE.meta.duration || STATE.meta.duration === STATE.lastTrackDuration)
+      ) {
         STATE.meta.duration = extracted.duration;
         durationJustResolved = true;
         updateProgressBarUI(getActiveVideoElement());
@@ -2796,10 +2921,9 @@
     if (STATE.meta && STATE.meta.videoId) {
       STATE.lastTrackVideoId = STATE.meta.videoId;
     }
-    if (STATE.meta && STATE.meta.duration > 0) {
-      STATE.lastTrackDuration = STATE.meta.duration;
+    if (!STATE.trackTransitionTime || performance.now() - STATE.trackTransitionTime > 500) {
+      STATE.trackTransitionTime = performance.now();
     }
-    STATE.trackTransitionTime = performance.now();
     STATE.isScrubbing = false;
 
     // 만약 방금 추출된 videoId가 이전 곡의 videoId와 동일하다면(자동재생 전환 직후 DOM 미갱신 상태) 비워둠
