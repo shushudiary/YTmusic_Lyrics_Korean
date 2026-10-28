@@ -1,3 +1,5 @@
+# 이 확장 프로그램은 Gemini Argon을 통해 바이브 코딩 됨.
+
 # 🎵 YTmusic_Lyrics_Korean
 
 <p align="center">
