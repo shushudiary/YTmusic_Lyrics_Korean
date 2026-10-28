@@ -74,7 +74,7 @@ YTmusic_Lyrics_Korean/
 
 1. 저장소를 클론하거나 ZIP 파일로 다운로드 후 압축을 풉니다.
    ```bash
-   git clone https://github.com/your-username/YTmusic_Lyrics_Korean.git
+   git clone https://github.com/shushudiary/YTmusic_Lyrics_Korean.git
    ```
 2. Chrome 또는 Chromium 기반 브라우저(Edge, Whale, Brave 등)를 열고 주소창에 `chrome://extensions`를 입력합니다.
 3. 우측 상단의 **개발자 모드(Developer mode)** 토글을 활성화합니다.
