@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YouTube Music 실시간 가사 설정</title>
+  <style>
+    :root {
+      --bg-primary: #141418;
+      --bg-card: rgba(255, 255, 255, 0.07);
+      --bg-card-hover: rgba(255, 255, 255, 0.1);
+      --border-subtle: rgba(255, 255, 255, 0.1);
+      --accent-apple: #fa2d48;
+      --accent-apple-glow: rgba(250, 45, 72, 0.35);
+      --text-primary: #ffffff;
+      --text-secondary: rgba(255, 255, 255, 0.65);
+      --text-muted: rgba(255, 255, 255, 0.42);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      width: 340px;
+      min-height: 240px;
+      padding: 18px;
+      background: radial-gradient(circle at top right, #2a1621 0%, var(--bg-primary) 65%);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Malgun Gothic", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      margin-bottom: 16px;
+      padding-bottom: 13px;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .header-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      background: linear-gradient(135deg, #fa2d48 0%, #ff5e3a 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 14px var(--accent-apple-glow);
+      flex-shrink: 0;
+    }
+
+    .header-icon svg {
+      width: 18px;
+      height: 18px;
+      fill: #ffffff;
+    }
+
+    .header-titles {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .header-title {
+      font-size: 14.5px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .header-subtitle {
+      font-size: 11.5px;
+      color: var(--text-secondary);
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 13px;
+      padding: 14px;
+      margin-bottom: 12px;
+      backdrop-filter: blur(16px);
+    }
+
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .setting-info {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .setting-label {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .setting-desc {
+      font-size: 11.5px;
+      line-height: 1.42;
+      color: var(--text-secondary);
+      word-break: keep-all;
+    }
+
+    /* Apple iOS 스타일 토글 스위치 */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 25px;
+      flex-shrink: 0;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background-color: rgba(255, 255, 255, 0.2);
+      transition: background-color 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+      border-radius: 999px;
+    }
+
+    .slider::before {
+      position: absolute;
+      content: "";
+      height: 21px;
+      width: 21px;
+      left: 2px;
+      bottom: 2px;
+      background-color: #ffffff;
+      transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+      border-radius: 50%;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.35);
+    }
+
+    .switch input:checked + .slider {
+      background-color: var(--accent-apple);
+    }
+
+    .switch input:checked + .slider::before {
+      transform: translateX(19px);
+    }
+
+    /* 저장된 가사 현황 및 비우기 영역 */
+    .storage-status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 12px;
+      padding-top: 11px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .storage-count-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .note-badge-preview {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: rgba(250, 45, 72, 0.92);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 6px rgba(250, 45, 72, 0.4);
+    }
+
+    .note-badge-preview svg {
+      width: 10px;
+      height: 10px;
+      fill: #ffffff;
+    }
+
+    .storage-count-num {
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .clear-btn {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text-primary);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 8px;
+      padding: 5px 10px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.18s ease;
+    }
+
+    .clear-btn:hover {
+      background: rgba(250, 45, 72, 0.22);
+      border-color: rgba(250, 45, 72, 0.5);
+      color: #ff8a9a;
+    }
+
+    .clear-btn:active {
+      transform: scale(0.96);
+    }
+
+    .footer-tip {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.4;
+      text-align: center;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="header-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24">
+        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
+      </svg>
+    </div>
+    <div class="header-titles">
+      <h1 class="header-title">YouTube Music 실시간 가사</h1>
+      <span class="header-subtitle">가사 저장 및 앨범 표지 배지 설정</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <div class="setting-row">
+      <div class="setting-info">
+        <span class="setting-label">가사 자동 저장 (로컬 캐싱)</span>
+        <p class="setting-desc">
+          좋아요·저장목록 곡의 가사를 기기에 저장하고 앨범 표지 우측 상단에 음표(♪) 배지를 표시합니다.
+        </p>
+      </div>
+      <label class="switch" title="가사 저장 기능 켜기/끄기">
+        <input type="checkbox" id="toggle-persistent-cache" checked />
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="storage-status-row">
+      <div class="storage-count-wrap">
+        <span class="note-badge-preview" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
+          </svg>
+        </span>
+        <span>저장된 가사: <strong class="storage-count-num" id="saved-count">0곡</strong></span>
+      </div>
+      <button type="button" class="clear-btn" id="clear-storage-btn">비우기</button>
+    </div>
+  </section>
+
+  <p class="footer-tip" id="status-message">
+    설정 변경 사항은 열려 있는 YouTube Music 탭에 즉시 반영됩니다.
+  </p>
+
+  <script src="popup.js"></script>
+</body>
+</html>

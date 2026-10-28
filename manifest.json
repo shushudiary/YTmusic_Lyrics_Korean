@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Music 실시간 가사 연동",
+  "version": "1.0.0",
+  "description": "Apple Music 전체화면 플레이어 UI 및 5대 멀티 소스(YTM TimedLyrics, 알송, LRCLIB, NetEase, QQ Music) 실시간 싱크 가사 확장 프로그램",
+  "permissions": [
+    "storage",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://music.youtube.com/*",
+    "https://lrclib.net/*",
+    "https://music.163.com/*",
+    "https://c.y.qq.com/*",
+    "https://lyric.altools.co.kr/*",
+    "http://lyric.altools.co.kr/*"
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "YouTube Music 실시간 가사 설정",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon32.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "options_page": "popup.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://music.youtube.com/*"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
