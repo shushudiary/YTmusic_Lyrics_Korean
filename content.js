@@ -64,6 +64,8 @@
     fetchedWithVideoId: '',         // 현재 트랙 가사 검색 시 사용된 videoId
     fetchedWithDuration: 0,         // 현재 트랙 가사 검색 시 사용된 duration
     requestSeq: 0,                  // 비동기 요청 시퀀스 번호
+    preferredProviderKey: 'auto',
+    pendingSeek: null,
     retryTimer: null,               // 메타데이터 안정화 대기 타이머
     nativeLyricsPollTimer: null     // YTM 기본 가사 폴백 타이머
   };
@@ -330,6 +332,30 @@
     const videoCur =
       vid && Number.isFinite(vid.currentTime) && vid.currentTime >= 0 ? vid.currentTime : 0;
 
+    // 0. MAIN world 페이지 브리지(page-bridge.js)가 #movie_player API에서 직접 읽어온 순수 트랙 시간/길이 확인
+    const ds = document.documentElement.dataset;
+    const bridgeVid = ds.ytmAlVideoId || '';
+    const bridgeTitle = ds.ytmAlVideoTitle || '';
+    const normRef = (targetRawTitle || STATE.meta.rawTitle || '')
+      ? sanitizeTrackTitle(targetRawTitle || STATE.meta.rawTitle || '')
+          .toLowerCase()
+          .replace(/\s+/g, '')
+      : '';
+    const normBridgeTitle = bridgeTitle
+      ? sanitizeTrackTitle(bridgeTitle).toLowerCase().replace(/\s+/g, '')
+      : '';
+    const isBridgeCurrentTrack =
+      Date.now() - Number(ds.ytmAlTimeUpdatedAt || 0) < 1500 &&
+      bridgeVid &&
+      (!STATE.meta.videoId || bridgeVid === STATE.meta.videoId) &&
+      (bridgeVid !== STATE.lastTrackVideoId ||
+        (normRef &&
+          normBridgeTitle &&
+          (normBridgeTitle.includes(normRef) || normRef.includes(normBridgeTitle))));
+
+    const bridgeCur = isBridgeCurrentTrack ? Number(ds.ytmAlCurrentTime) : -1;
+    const bridgeDur = isBridgeCurrentTrack ? Number(ds.ytmAlDuration) : 0;
+
     // 1. 트랙 전환 직후 1.6초 이내에 하단 .time-info가 아직 이전 곡의 끝 시간(예: 3:00 / 3:00)에 머물러 있는지 판별
     let effectiveBarCur = barCur;
     if (justTransitioned && effectiveBarCur > 4) {
@@ -357,6 +383,9 @@
     } else if (queueDur > 0) {
       STATE.lockedTrackDuration = queueDur;
       dur = queueDur;
+    } else if (Number.isFinite(bridgeDur) && bridgeDur > 1 && bridgeDur !== STATE.lastTrackDuration) {
+      STATE.lockedTrackDuration = bridgeDur;
+      dur = bridgeDur;
     } else if (barDur > 0) {
       const isFreshBarDur =
         !justTransitioned ||
@@ -375,7 +404,23 @@
       dur = STATE.meta.duration || 0;
     }
 
-    // 3. 현재 경과 시간(cur) 산출 (곡 시작부터 끝까지 상시 MSE 오프셋 보정 + 60fps 밀리초 보간):
+    // 탐색 직후 재생바 텍스트가 늦게 갱신되어 이전 줄로 되돌아가지 않도록 한다.
+    const pendingSeek = STATE.pendingSeek;
+    if (pendingSeek && pendingSeek.trackKey === STATE.currentTrackKey) {
+      const elapsed = (now - pendingSeek.startedAt) / 1000;
+      const actual = pendingSeek.viaBridge ? bridgeCur : videoCur - pendingSeek.mediaOffset;
+      if (elapsed < 1.5) {
+        const cur = Number.isFinite(actual) && actual >= 0 && Math.abs(actual - pendingSeek.time) < 2
+          ? actual
+          : pendingSeek.time + (vid && !vid.paused ? Math.max(0, elapsed) : 0);
+        return { cur: dur > 0 ? Math.min(dur, cur) : cur, dur };
+      }
+      STATE.pendingSeek = null;
+    }
+
+    // 3. 현재 경과 시간(cur) 산출:
+    //    (A) #movie_player.getCurrentTime() 브리지 값이 유효하고 현재 곡 범위 내라면 최우선 사용
+    //    (B) 그렇지 않으면 하단 재생바 시간(barCur) + 60fps 밀리초 보간값(smoothBarCur)을 상시 사용
     let cur = 0;
     if (effectiveBarCur >= 0) {
       if (effectiveBarCur !== STATE.lastBarCur) {
@@ -389,14 +434,20 @@
           : 0;
       const smoothBarCur = effectiveBarCur + subSec;
 
-      // <video>.currentTime이 하단 재생바 시간과 1.5초 이내로 일치할 때만 <video>.currentTime을 사용하고,
-      // MSE 연속 재생으로 인해 <video>.currentTime이 이전 곡 길이만큼 누적(예: 182.2초 vs 실제 2.2초)되어 있으면
-      // 곡이 끝날 때까지 내내 smoothBarCur를 사용하여 가사가 맨 뒤로 점프하는 현상을 완벽히 방지!
-      if (!justTransitioned && Math.abs(videoCur - smoothBarCur) <= 1.5) {
+      if (
+        !justTransitioned &&
+        Number.isFinite(bridgeCur) &&
+        bridgeCur >= 0 &&
+        Math.abs(bridgeCur - smoothBarCur) <= 1.5
+      ) {
+        cur = bridgeCur;
+      } else if (!justTransitioned && Math.abs(videoCur - smoothBarCur) <= 1.5) {
         cur = videoCur;
       } else {
         cur = smoothBarCur;
       }
+    } else if (Number.isFinite(bridgeCur) && bridgeCur >= 0 && (!justTransitioned || bridgeCur <= 4)) {
+      cur = bridgeCur;
     } else {
       cur = justTransitioned && videoCur > 4 ? 0 : videoCur;
     }
@@ -420,7 +471,25 @@
       ? sanitizeTrackTitle(rawTitle).toLowerCase().replace(/\s+/g, '')
       : '';
 
-    // 1. 하단 플레이어 바(ytmusic-player-bar) 내부에 현재 곡 전용 watch?v= 링크가 있는 경우 최우선
+    // 0. MAIN world 브리지(page-bridge.js)가 #movie_player.getVideoData()에서 직접 추출한 실시간 videoId 최우선 확인
+    const ds = document.documentElement.dataset;
+    const bridgeVid = ds.ytmAlVideoId || '';
+    const bridgeTitle = ds.ytmAlVideoTitle || '';
+    if (Date.now() - Number(ds.ytmAlTimeUpdatedAt || 0) < 1500 && /^[a-zA-Z0-9_-]{11}$/.test(bridgeVid)) {
+      const normBridgeTitle = bridgeTitle
+        ? sanitizeTrackTitle(bridgeTitle).toLowerCase().replace(/\s+/g, '')
+        : '';
+      const titleMatches =
+        normTargetTitle &&
+        normBridgeTitle &&
+        (normBridgeTitle.includes(normTargetTitle) || normTargetTitle.includes(normBridgeTitle));
+
+      if (bridgeVid !== STATE.lastTrackVideoId || titleMatches) {
+        return bridgeVid;
+      }
+    }
+
+    // 1. 하단 플레이어 바(ytmusic-player-bar) 내부에 현재 곡 전용 watch?v= 링크가 있는 경우
     const barLink = document.querySelector('ytmusic-player-bar a[href*="watch?v="]');
     if (barLink) {
       const href = barLink.getAttribute('href') || '';
@@ -681,9 +750,9 @@
    * 동일 출처(https://music.youtube.com)에서:
    * 1) 현재 곡의 가사 탭 browseId (MPLYt_...) 추출
    * 2) 영어 로케일(hl: 'en', gl: 'US')로 공식 영문 곡 제목(enTitle) 및 영문 아티스트명(enArtist) 추출
-   * 3) 만약 WEB_REMIX 자체에 timedLyricsData가 포함되어 있으면 즉시 반환
+   * 3) 공식 가사를 요청한 경우 현재 탭의 로그인 세션으로 모바일 가사를 조회
    */
-  async function fetchYtmWebRemixMetadata(videoId, meta) {
+  async function fetchYtmWebRemixMetadata(videoId, meta, includeLyrics = false) {
     const result = {
       lyricsBrowseId: '',
       enTitle: '',
@@ -706,7 +775,8 @@
     const webKoContext = {
       client: {
         clientName: 'WEB_REMIX',
-        clientVersion: '1.20250101.01.00',
+        clientVersion: document.documentElement.dataset.ytmAlClientVersion ||
+          `1.${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.01.00`,
         hl: 'ko',
         gl: 'KR'
       }
@@ -715,37 +785,28 @@
     const webEnContext = {
       client: {
         clientName: 'WEB_REMIX',
-        clientVersion: '1.20250101.01.00',
+        clientVersion: document.documentElement.dataset.ytmAlClientVersion ||
+          `1.${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.01.00`,
         hl: 'en',
         gl: 'US'
       }
     };
 
-    try {
-      let targetVid = videoId;
-
-      // 만약 홈 화면 등에서 재생하여 videoId가 아직 없다면 동일 출처 검색으로 공식 음원 videoId 확보
-      if (!targetVid) {
-        const qTitle = (meta?.cleanTitle || meta?.rawTitle || '').trim();
-        const qArtist = (meta?.cleanArtist || meta?.rawArtist || '').trim();
-        if (qTitle) {
-          const searchRes = await fetch('/youtubei/v1/search?prettyPrint=false', {
-            method: 'POST',
-            credentials: 'omit',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              context: webKoContext,
-              query: `${qTitle} ${qArtist}`.trim(),
-              params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D'
-            })
-          });
-          if (searchRes.ok) {
-            const searchText = await searchRes.text();
-            const m = searchText.match(/"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/);
-            if (m) targetVid = m[1];
-          }
-        }
+    const fetchMetadata = async (url, options) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        return response.ok ? await response.text() : '';
+      } catch (error) {
+        return '';
+      } finally {
+        clearTimeout(timer);
       }
+    };
+
+    try {
+      const targetVid = videoId;
 
       if (!targetVid) return result;
       result.resolvedVideoId = targetVid;
@@ -753,40 +814,48 @@
       // 병렬로 (1) 가사 browseId(MPLYt_...) 조회 및 (2) 영문 제목/아티스트(hl: 'en') 조회 실행
       const authHeaders = await buildYouTubeSapisidHeaders();
 
-      const nextPromise = fetch('/youtubei/v1/next?prettyPrint=false', {
+      const nextPromise = fetchMetadata('/youtubei/v1/next?prettyPrint=false', {
         method: 'POST',
         credentials: 'same-origin',
         headers: authHeaders,
         body: JSON.stringify({
           context: webKoContext,
-          videoId: targetVid
+          videoId: targetVid,
+          playlistId: `RDAMVM${targetVid}`,
+          isAudioOnly: true,
+          enablePersistentPlaylistPanel: true,
+          tunerSettingValue: 'AUTOMIX_SETTING_NORMAL'
         })
-      }).catch(() => null);
+      });
 
-      const enNextPromise = fetch('/youtubei/v1/next?prettyPrint=false', {
+      const enNextPromise = fetchMetadata('/youtubei/v1/next?prettyPrint=false', {
         method: 'POST',
         credentials: 'omit',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           context: webEnContext,
-          videoId: targetVid
+          videoId: targetVid,
+          playlistId: `RDAMVM${targetVid}`,
+          isAudioOnly: true,
+          enablePersistentPlaylistPanel: true,
+          tunerSettingValue: 'AUTOMIX_SETTING_NORMAL'
         })
-      }).catch(() => null);
+      });
 
       const [nextRes, enNextRes] = await Promise.all([nextPromise, enNextPromise]);
 
-      if (nextRes && nextRes.ok) {
-        const nextText = await nextRes.text();
-        const browseMatch = nextText.match(/"browseId"\s*:\s*"(MPLYt_[^"]+)"/);
+      if (nextRes) {
+        const nextText = nextRes;
+        const browseMatch = nextText.match(/"browseId"\s*:\s*"(MPLYt[^"]+)"/);
         if (browseMatch) {
           result.lyricsBrowseId = browseMatch[1];
         }
       }
 
-      if (enNextRes && enNextRes.ok) {
-        const enText = await enNextRes.text();
+      if (enNextRes) {
+        const enText = enNextRes;
         if (!result.lyricsBrowseId) {
-          const browseMatch = enText.match(/"browseId"\s*:\s*"(MPLYt_[^"]+)"/);
+          const browseMatch = enText.match(/"browseId"\s*:\s*"(MPLYt[^"]+)"/);
           if (browseMatch) {
             result.lyricsBrowseId = browseMatch[1];
           }
@@ -794,7 +863,7 @@
         try {
           const enData = JSON.parse(enText);
           const panelVideo = findKey(enData, 'playlistPanelVideoRenderer');
-          if (panelVideo) {
+          if (panelVideo && panelVideo.videoId === targetVid) {
             const tRuns = panelVideo?.title?.runs;
             if (Array.isArray(tRuns) && tRuns[0]?.text) {
               result.enTitle = sanitizeTrackTitle(tRuns[0].text);
@@ -805,6 +874,23 @@
             }
           }
         } catch (e) {}
+      }
+      if (includeLyrics && result.lyricsBrowseId) {
+        // ytm_mobile=1을 붙이지 않는다. 그 경로의 DNR 규칙은 로그인 쿠키를 제거한다.
+        const browseText = await fetchMetadata('/youtubei/v1/browse?prettyPrint=false', {
+          method: 'POST', credentials: 'same-origin', headers: authHeaders,
+          body: JSON.stringify({
+            context: { client: { clientName: 'ANDROID_MUSIC', clientVersion: '7.21.50', hl: 'ko', gl: 'KR' } },
+            browseId: result.lyricsBrowseId
+          })
+        });
+        if (browseText) {
+          const parsed = await chrome.runtime.sendMessage({
+            type: 'PARSE_YTM_LYRICS',
+            payload: { browseData: JSON.parse(browseText), videoId: targetVid }
+          });
+          if (parsed?.ok) result.timedLyricsResult = parsed.data;
+        }
       }
     } catch (e) {}
 
@@ -1399,6 +1485,11 @@
     STATE.preferredProviderKey = providerKey;
 
     if (providerKey === 'ytm_native') {
+      ++STATE.requestSeq;
+      clearTimeout(STATE.retryTimer);
+      clearTimeout(STATE.nativeLyricsPollTimer);
+      STATE.lyricsLines = [];
+      STATE.plainLyricsText = '';
       const nativeText = extractNativeYtmLyrics();
       if (nativeText) {
         STATE.plainLyricsText = nativeText;
@@ -1419,7 +1510,7 @@
       return;
     }
 
-    requestMultiSourceLyrics(STATE.meta, { preferredSource: providerKey });
+    requestMultiSourceLyrics(STATE.meta, { preferredSource: providerKey, forceRefresh: true });
   }
 
   /**
@@ -2141,17 +2232,14 @@
     const seekFromPointer = (clientX) => {
       const video = getActiveVideoElement();
       if (!video) return;
-      const { cur, dur } = getEffectivePlaybackState(video);
+      const { dur } = getEffectivePlaybackState(video);
       if (dur <= 0) return;
 
       const rect = scrubberTrack.getBoundingClientRect();
+      if (rect.width <= 0) return;
       const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
       const targetTrackSec = ratio * dur;
-      const deltaSec = targetTrackSec - cur;
-
-      video.currentTime = Math.max(0, (Number.isFinite(video.currentTime) ? video.currentTime : 0) + deltaSec);
-      STATE.lastBarCur = Math.floor(targetTrackSec);
-      STATE.lastBarCurPerfTime = performance.now();
+      seekToTrackTime(video, targetTrackSec);
       updateProgressBarUI(video);
     };
 
@@ -2743,20 +2831,36 @@
     }
   }
 
+  function seekToTrackTime(video, timeSec) {
+    if (!video || !Number.isFinite(timeSec) || STATE.isAdPlaying) return false;
+    const ds = document.documentElement.dataset;
+    if (Date.now() - Number(ds.ytmAlTimeUpdatedAt || 0) < 1500 &&
+        ds.ytmAlVideoId && STATE.meta.videoId && ds.ytmAlVideoId !== STATE.meta.videoId) return false;
+    const { cur, dur } = getEffectivePlaybackState(video);
+    const targetTrackTime = Math.max(0, dur > 0 ? Math.min(timeSec, dur) : timeSec);
+    // 브리지 호출 전에 계산한다. 호출 이후 video.currentTime은 이미 이동했을 수 있다.
+    const mediaOffset = (Number.isFinite(video.currentTime) ? video.currentTime : 0) - cur;
+    const command = new CustomEvent('ytm-al-bridge-cmd', {
+      cancelable: true,
+      detail: { action: 'seekTo', timeSec: targetTrackTime, videoId: STATE.meta.videoId || '' }
+    });
+    const viaBridge = !window.dispatchEvent(command);
+    if (!viaBridge) {
+      video.currentTime = Math.max(0, targetTrackTime + mediaOffset);
+    }
+    STATE.pendingSeek = {
+      time: targetTrackTime, startedAt: performance.now(),
+      trackKey: STATE.currentTrackKey, mediaOffset, viaBridge
+    };
+    STATE.lastBarCur = Math.floor(targetTrackTime);
+    STATE.lastBarCurPerfTime = performance.now();
+    return true;
+  }
+
   function seekToLyricTime(timeSec) {
     const video = getActiveVideoElement();
     if (!video || !Number.isFinite(timeSec)) return;
-
-    const targetTrackTime = Math.max(0, timeSec - STATE.offsetSec);
-    const { cur } = getEffectivePlaybackState(video);
-    const deltaSec = targetTrackTime - cur;
-
-    video.currentTime = Math.max(
-      0,
-      (Number.isFinite(video.currentTime) ? video.currentTime : 0) + deltaSec
-    );
-    STATE.lastBarCur = Math.floor(targetTrackTime);
-    STATE.lastBarCurPerfTime = performance.now();
+    if (!seekToTrackTime(video, timeSec - STATE.offsetSec)) return;
 
     if (video.paused) {
       video.play().catch(() => {});
@@ -2898,7 +3002,7 @@
         return;
       }
 
-      if (STATE.lyricsStatus === 'not_found') {
+      if (STATE.lyricsStatus === 'not_found' && STATE.preferredProviderKey === 'auto') {
         const nativeText = extractNativeYtmLyrics();
         if (nativeText) {
           STATE.plainLyricsText = nativeText;
@@ -2925,6 +3029,7 @@
       STATE.trackTransitionTime = performance.now();
     }
     STATE.isScrubbing = false;
+    STATE.pendingSeek = null;
 
     // 만약 방금 추출된 videoId가 이전 곡의 videoId와 동일하다면(자동재생 전환 직후 DOM 미갱신 상태) 비워둠
     const safeInitialVideoId =
@@ -3329,8 +3434,10 @@
    *    1차 레이싱에서 못 찾은 경우에만 2차 보강 검색 수행!
    */
   function requestMultiSourceLyrics(meta, options = {}) {
+    const preferredSource = options.preferredSource || STATE.preferredProviderKey || 'auto';
+    if (preferredSource === 'ytm_native') return;
     const currentSeq = ++STATE.requestSeq;
-    const preferredSource = options.preferredSource || 'auto';
+    STATE.preferredProviderKey = preferredSource;
     const forceRefresh = Boolean(options.forceRefresh);
 
     if (STATE.retryTimer) {
@@ -3373,19 +3480,23 @@
 
     const sendFetchToBg = (payloadObj) =>
       new Promise((resolve) => {
-        chrome.runtime.sendMessage(
-          {
-            type: 'FETCH_LYRICS',
-            payload: payloadObj
-          },
-          (response) => {
-            if (chrome.runtime.lastError || !response || !response.ok) {
-              resolve(null);
-            } else {
-              resolve(response.data);
+        try {
+          chrome.runtime.sendMessage(
+            {
+              type: 'FETCH_LYRICS',
+              payload: payloadObj
+            },
+            (response) => {
+              if (chrome.runtime.lastError || !response || !response.ok) {
+                resolve({ status: 'error' });
+              } else {
+                resolve(response.data);
+              }
             }
-          }
-        );
+          );
+        } catch (error) {
+          resolve({ status: 'error' });
+        }
       });
 
     STATE.retryTimer = setTimeout(async () => {
@@ -3417,98 +3528,78 @@
       }
       updatePlayerPageVisuals();
 
-      // 사용자가 우클릭으로 특정 제공자(예: YTM 공식)를 지정했는데 아직 browseId/enTitle이 없다면 먼저 확보
-      if (
-        preferredSource !== 'auto' &&
-        (!STATE.meta.lyricsBrowseId || !STATE.meta.enTitle)
-      ) {
-        const ytmMetaPre = await fetchYtmWebRemixMetadata(STATE.meta.videoId, STATE.meta);
-        if (currentSeq !== STATE.requestSeq) return;
-        if (ytmMetaPre.resolvedVideoId && !STATE.meta.videoId) {
-          STATE.meta.videoId = ytmMetaPre.resolvedVideoId;
-          STATE.fetchedWithVideoId = ytmMetaPre.resolvedVideoId;
-        }
-        if (ytmMetaPre.lyricsBrowseId) {
-          STATE.meta.lyricsBrowseId = ytmMetaPre.lyricsBrowseId;
-        }
-        if (ytmMetaPre.enTitle) {
-          STATE.meta.enTitle = ytmMetaPre.enTitle;
-        }
-        if (ytmMetaPre.enArtist) {
-          STATE.meta.enArtist = ytmMetaPre.enArtist;
-        }
-      }
-
       // [트랙 1] 기다리지 않고 즉시 백그라운드 레이싱(또는 지정 제공자 검색) 출발!
       const fastBgPromise = sendFetchToBg(STATE.meta);
 
       // [트랙 2] 동시에 YTM 동일 출처 API에서 가사 browseId(MPLYt_...)와 영문 제목(enTitle) 조회
-      const ytmMetaPromise =
-        preferredSource === 'auto'
-          ? fetchYtmWebRemixMetadata(STATE.meta.videoId, STATE.meta)
-          : Promise.resolve({});
+      const ytmMetaPromise = fetchYtmWebRemixMetadata(
+        STATE.meta.videoId, STATE.meta, preferredSource === 'auto' || preferredSource === 'ytm'
+      );
+      const mergeMetadata = (extra) => {
+        if (currentSeq !== STATE.requestSeq) return false;
+        let changed = false;
+        for (const key of ['lyricsBrowseId', 'enTitle', 'enArtist']) {
+          if (extra[key] && STATE.meta[key] !== extra[key]) {
+            STATE.meta[key] = extra[key];
+            changed = true;
+          }
+        }
+        return changed;
+      };
 
-      const fastResult = await fastBgPromise;
+      const fastResult = await Promise.race([
+        fastBgPromise,
+        (async () => {
+          const extra = await ytmMetaPromise;
+          return extra.timedLyricsResult?.status === 'synced' ? extra.timedLyricsResult : await fastBgPromise;
+        })()
+      ]);
       if (currentSeq !== STATE.requestSeq) return;
 
       // 1차 고속 레이싱에서 실시간 싱크 가사를 찾았다면(0.01초~0.4초) 즉시 화면에 렌더링하고 종료!
       if (applySyncedResult(fastResult)) {
+        mergeMetadata(await ytmMetaPromise);
         return;
       }
 
+      const ytmMeta = await ytmMetaPromise;
+      if (currentSeq !== STATE.requestSeq) return;
+      if (applySyncedResult(ytmMeta.timedLyricsResult)) return;
+      let secondResult = null;
+      if (mergeMetadata(ytmMeta)) {
+        secondResult = await sendFetchToBg({ ...STATE.meta, forceRefresh: true });
+        if (currentSeq !== STATE.requestSeq) return;
+        if (applySyncedResult(secondResult)) return;
+      }
+      const finalBgResult = secondResult?.plainLyrics ? secondResult
+        : fastResult?.plainLyrics ? fastResult
+          : ytmMeta.timedLyricsResult?.plainLyrics ? ytmMeta.timedLyricsResult : secondResult || fastResult;
+
       // 사용자가 특정 제공자를 수동 선택한 경우 다른 제공자로 폴백하지 않고 해당 제공자의 결과만 반영
       if (preferredSource !== 'auto') {
-        if (fastResult && fastResult.plainLyrics) {
-          STATE.plainLyricsText = fastResult.plainLyrics;
+        if (finalBgResult && finalBgResult.plainLyrics) {
+          STATE.plainLyricsText = finalBgResult.plainLyrics;
           STATE.lyricsStatus = 'plain';
-          STATE.currentSourceStage = fastResult.sourceStage || preferredSource;
-          STATE.lyricsSourceLabel = `일반 가사 (${preferredSource.toUpperCase()})`;
+          STATE.currentSourceStage = finalBgResult.sourceStage || preferredSource;
+          const labelMap = {
+            ytm: '일반 가사 (YTM 공식)',
+            lrclib: '일반 가사 (LRCLIB)',
+            alsong: '일반 가사 (알송)',
+            netease: '일반 가사 (NetEase)',
+            qq: '일반 가사 (QQ Music)'
+          };
+          STATE.lyricsSourceLabel =
+            labelMap[preferredSource] || `일반 가사 (${preferredSource.toUpperCase()})`;
         } else {
           STATE.lyricsStatus = 'not_found';
           STATE.currentSourceStage = 'none';
-          STATE.lyricsSourceLabel = '선택한 제공자에 가사 없음';
+          STATE.lyricsSourceLabel = finalBgResult?.status === 'error'
+            ? '선택한 제공자에 연결하지 못했습니다. 다시 선택해 주세요.'
+            : '선택한 제공자에서 가사를 찾지 못했습니다';
         }
         renderLyricsView();
         return;
       }
-
-      // 만약 1차에서 못 찾았다면(예: 한글 제목만 있어서 영문 제목이나 YTM MPLYt_가 필요한 곡),
-      // 병렬로 받아온 ytmMeta(lyricsBrowseId, enTitle, enArtist)로 즉시 2차 검색!
-      const ytmMeta = await ytmMetaPromise;
-      if (currentSeq !== STATE.requestSeq) return;
-
-      let hasNewYtmMeta = false;
-      if (ytmMeta.resolvedVideoId && !STATE.meta.videoId) {
-        STATE.meta.videoId = ytmMeta.resolvedVideoId;
-        STATE.fetchedWithVideoId = ytmMeta.resolvedVideoId;
-        hasNewYtmMeta = true;
-      }
-      if (ytmMeta.lyricsBrowseId && STATE.meta.lyricsBrowseId !== ytmMeta.lyricsBrowseId) {
-        STATE.meta.lyricsBrowseId = ytmMeta.lyricsBrowseId;
-        hasNewYtmMeta = true;
-      }
-      if (ytmMeta.enTitle && ytmMeta.enTitle !== STATE.meta.cleanTitle) {
-        STATE.meta.enTitle = ytmMeta.enTitle;
-        hasNewYtmMeta = true;
-      }
-      if (ytmMeta.enArtist && ytmMeta.enArtist !== STATE.meta.cleanArtist) {
-        STATE.meta.enArtist = ytmMeta.enArtist;
-        hasNewYtmMeta = true;
-      }
-
-      let secondResult = null;
-      if (hasNewYtmMeta) {
-        secondResult = await sendFetchToBg({
-          ...STATE.meta,
-          persistToStorage: isLikedOrSavedTrack()
-        });
-        if (currentSeq !== STATE.requestSeq) return;
-        if (applySyncedResult(secondResult)) {
-          return;
-        }
-      }
-
-      const finalBgResult = secondResult || fastResult;
 
       // 외부 API에서 일반 가사(plainLyrics)라도 찾은 경우
       if (

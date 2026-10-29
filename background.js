@@ -25,10 +25,6 @@ const NETEASE_SEARCH_URL = 'https://music.163.com/api/search/get';
 const NETEASE_LYRIC_URL = 'https://music.163.com/api/song/lyric';
 const QQ_SEARCH_URL = 'https://c.y.qq.com/soso/fcgi-bin/client_search_cp';
 const QQ_LYRIC_URL = 'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg';
-const YTM_NEXT_MOBILE_URL =
-  'https://music.youtube.com/youtubei/v1/next?prettyPrint=false&ytm_mobile=1';
-const YTM_BROWSE_MOBILE_URL =
-  'https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&ytm_mobile=1';
 
 const LRCLIB_HEADERS = {
   'Accept': 'application/json',
@@ -64,7 +60,7 @@ function ensureDeclarativeNetRequestRules() {
                 header: 'User-Agent',
                 operation: 'set',
                 value:
-                  'com.google.android.apps.youtube.music/6.42.52 (Linux; U; Android 13; ko_KR; Pixel 7 Build/TQ3A.230805.001) gzip'
+                  'com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 13; ko_KR; Pixel 7 Build/TQ3A.230805.001) gzip'
               },
               {
                 header: 'X-Goog-Api-Format-Version',
@@ -400,59 +396,53 @@ function buildCanonicalTrackKey(meta, titleVariants = [], artistVariants = []) {
 }
 
 function generateTitleVariants(rawTitle = '', cleanTitle = '', enTitle = '') {
-  const variants = new Set();
+  const ordered = [];
+  const addUnique = (val) => {
+    const t = String(val || '').trim();
+    if (t && !ordered.includes(t)) ordered.push(t);
+  };
+
+  // 괄호 내부가 부가 정보(OST, Part, 리마스터, 버전, 피처링 등)인지 판별하는 정규식
+  const bracketMetaNoiseRegex =
+    /(?:\b(?:mv|m\/v|ost|part|pt|ver|version|inst|instrumental|live|audio|video|hd|4k|hq|official|lyrics?|feat|ft|with|prod|produced|remix|remaster(?:ed)?|edit|mix|acoustic|clean|explicit|session|clip|special|original|soundtrack|theme|from|intro|outro|solo|japanese|korean|english)\b|\d{4}|뮤직\s*비디오|뮤비|가사|공식|라이브|리마스터|녹음실|반주|음원|노래방|드라마|영화|웹툰|스페셜|버전|편곡)/i;
+
   const seeds = [cleanTitle, enTitle, rawTitle].filter(Boolean);
+
+  // 각 언어의 대표 제목을 먼저 배치한다. 괄호 변형이 영문 제목을 밀어내지 않게 한다.
+  for (const seed of seeds) {
+    addUnique(String(seed).replace(/[\(\[\{【『（][^)\]}】』）]*[\)\]\}】』）]/g, ' ').replace(/\s{2,}/g, ' ').trim());
+  }
 
   for (const seed of seeds) {
     const base = String(seed).trim();
     if (!base) continue;
-    variants.add(base);
+
+    const withoutBrackets = base
+      .replace(/[\(\[\{【『（][^)\]}】』）]*[\)\]\}】』）]/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+
+    if (withoutBrackets) {
+      addUnique(withoutBrackets);
+    }
+    addUnique(base);
 
     const bracketMatches = [...base.matchAll(/[\(\[\{【『（]([^)\]}】』）]+)[\)\]\}】』）]/g)];
-    if (bracketMatches.length > 0) {
-      const withoutBrackets = base
-        .replace(/[\(\[\{【『（][^)\]}】』）]+[\)\]\}】』）]/g, ' ')
-        .replace(/\s{2,}/g, ' ')
-        .trim();
-      if (withoutBrackets) variants.add(withoutBrackets);
-
-      for (const m of bracketMatches) {
-        const inner = m[1].trim();
-        if (
-          inner.length >= 2 &&
-          !/^(mv|m\/v|ost|ver\.?|inst\.?|live|audio|video|hd|4k|official|lyrics?|feat\.?.*|prod\.?.*)$/i.test(
-            inner
-          )
-        ) {
-          variants.add(inner);
-        }
-      }
-    }
-
-    if (/\s+[-–—_]\s+/.test(base)) {
-      const parts = base
-        .split(/\s+[-–—_]\s+/)
-        .map((p) => p.trim())
-        .filter(Boolean);
-      for (const p of parts) {
-        if (p.length >= 1) variants.add(p);
+    for (const m of bracketMatches) {
+      const inner = m[1].trim();
+      // 순수 부제/영문 제목인 경우에만 후보에 추가하고, OST/버전/연도 등이 포함된 괄호는 절대 제목으로 쓰지 않음!
+      if (inner.length >= 2 && !bracketMetaNoiseRegex.test(inner)) {
+        addUnique(inner);
       }
     }
   }
 
-  for (const v of [...variants]) {
+  for (const v of [...ordered]) {
     const noPunct = v.replace(/[?!~.,'"’”`]+$/g, '').trim();
-    if (noPunct && noPunct !== v) variants.add(noPunct);
+    if (noPunct && noPunct !== v) addUnique(noPunct);
   }
 
-  const list = [...variants].filter(Boolean);
-  list.sort((a, b) => {
-    const aHasBracket = /[\(\[\{（]/.test(a) ? 1 : 0;
-    const bHasBracket = /[\(\[\{（]/.test(b) ? 1 : 0;
-    return aHasBracket - bHasBracket;
-  });
-
-  return list;
+  return ordered;
 }
 
 function generateArtistVariants(rawArtist = '', cleanArtist = '', rawTitle = '', enArtist = '') {
@@ -463,10 +453,6 @@ function generateArtistVariants(rawArtist = '', cleanArtist = '', rawTitle = '',
     const featMatch = rawTitle.match(/(?:feat|ft|with)\.?\s*([^)\]}]+)/i);
     if (featMatch && featMatch[1]) {
       seeds.push(featMatch[1].trim());
-    }
-    if (/\s+[-–—_]\s+/.test(rawTitle)) {
-      const parts = rawTitle.split(/\s+[-–—_]\s+/).map((s) => s.trim());
-      if (parts[0]) seeds.push(parts[0]);
     }
   }
 
@@ -520,6 +506,19 @@ function generateArtistVariants(rawArtist = '', cleanArtist = '', rawTitle = '',
   return [...variants].filter(Boolean);
 }
 
+function isSubstringMatchSafe(strA = '', strB = '', minRatio = 0.6) {
+  if (!strA || !strB) return false;
+  const shorter = strA.length <= strB.length ? strA : strB;
+  const longer = strA.length <= strB.length ? strB : strA;
+
+  const isAsciiOnly = !/[^\x00-\x7F]/.test(shorter);
+  const minChars = isAsciiOnly ? 4 : 2;
+  if (shorter.length < minChars) return false;
+  if (shorter.length / longer.length < minRatio) return false;
+
+  return longer.includes(shorter);
+}
+
 function evaluateArtistSimilarity(itemArtist = '', targetArtistVariants = []) {
   if (!itemArtist || targetArtistVariants.length === 0) return 0;
 
@@ -527,19 +526,30 @@ function evaluateArtistSimilarity(itemArtist = '', targetArtistVariants = []) {
   const normItemNoBracket = normalizeWithoutBrackets(itemArtist);
   if (!normItem) return 0;
 
+  let bestSim = 0;
+
   for (const variant of targetArtistVariants) {
     const normVar = normalizeForCompare(variant);
+    const normVarNoBracket = normalizeWithoutBrackets(variant);
     if (!normVar) continue;
 
-    if (normItem === normVar || normItemNoBracket === normVar) {
+    if (
+      normItem === normVar ||
+      normItemNoBracket === normVar ||
+      (normItemNoBracket && normItemNoBracket === normVarNoBracket)
+    ) {
       return 2;
     }
-    if (normItem.includes(normVar) || normVar.includes(normItem)) {
-      return 1;
+
+    if (
+      isSubstringMatchSafe(normItem, normVar, 0.5) ||
+      isSubstringMatchSafe(normItemNoBracket, normVarNoBracket, 0.5)
+    ) {
+      bestSim = Math.max(bestSim, 1);
     }
   }
 
-  return 0;
+  return bestSim;
 }
 
 function evaluateTitleSimilarity(itemTitle = '', targetTitleVariants = []) {
@@ -548,6 +558,8 @@ function evaluateTitleSimilarity(itemTitle = '', targetTitleVariants = []) {
   const normItem = normalizeForCompare(itemTitle);
   const normItemNoBracket = normalizeWithoutBrackets(itemTitle);
   if (!normItem) return 0;
+
+  let bestSim = 0;
 
   for (const variant of targetTitleVariants) {
     const normVar = normalizeForCompare(variant);
@@ -561,19 +573,24 @@ function evaluateTitleSimilarity(itemTitle = '', targetTitleVariants = []) {
     ) {
       return 2;
     }
-    if (normItem.includes(normVar) || normVar.includes(normItem)) {
-      return 1;
+
+    // 1글자 제목("비", "너", "나")이나 짧은 단어가 전혀 다른 긴 곡 제목에 부분 포함되어 오매칭되는 현상 원천 차단!
+    if (
+      isSubstringMatchSafe(normItemNoBracket || normItem, normVarNoBracket || normVar, 0.62)
+    ) {
+      bestSim = Math.max(bestSim, 1);
     }
   }
 
-  return 0;
+  return bestSim;
 }
 
 function msToLrcTimestamp(ms) {
-  const totalSec = Math.max(0, Number(ms) / 1000);
+  const totalMs = Math.max(0, Math.round(Number(ms) || 0));
+  const totalSec = totalMs / 1000;
   const mins = Math.floor(totalSec / 60);
   const secs = Math.floor(totalSec % 60);
-  const millis = Math.round((totalSec - Math.floor(totalSec)) * 1000);
+  const millis = totalMs % 1000;
   return `[${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(millis).padStart(3, '0')}]`;
 }
 
@@ -963,118 +980,129 @@ function findNestedKey(obj, targetKey) {
   return null;
 }
 
+// WEB_REMIX와 ANDROID_MUSIC은 같은 lyrics browseId를 사용할 수 있다.
+// 응답 형식은 browse 요청의 client context로 결정된다.
+function extractYtmLyrics(browseData) {
+  const timed = findNestedKey(browseData, 'timedLyricsData');
+  const readText = (value) => typeof value === 'string' ? value
+    : value?.simpleText || value?.runs?.map((r) => r.text || '').join('') || '';
+  const rows = Array.isArray(timed) ? timed : [];
+  const lines = rows.filter((item) => item && typeof item === 'object').map((item) => ({
+    text: readText(item.lyricLine ?? item.text).trim(),
+    time: item.cueRange?.startTimeMilliseconds ?? item.startTimeMs ?? item.cueRange?.startTimeMs
+  })).filter((row) => row.text);
+  if (lines.length && lines.every((row) => row.time !== undefined && row.time !== null &&
+      row.time !== '' && Number.isFinite(Number(row.time)) && Number(row.time) >= 0)) {
+    return {
+      status: 'synced',
+      syncedLyrics: lines.map((row) => `${msToLrcTimestamp(row.time)}${row.text}`).join('\n'),
+      plainLyrics: null,
+      sourceStage: 'ytm_timed_lyrics'
+    };
+  }
+  const shelf = findNestedKey(browseData, 'musicDescriptionShelfRenderer');
+  const plain = lines.map((row) => row.text).join('\n') || readText(shelf?.description).trim();
+  return plain ? {
+    status: 'plain', syncedLyrics: null, plainLyrics: plain, sourceStage: 'ytm_timed_lyrics'
+  } : null;
+}
+
+function findLyricsBrowseId(data) {
+  if (!data || typeof data !== 'object') return '';
+  if (typeof data.browseId === 'string' && data.browseId.startsWith('MPLYt')) return data.browseId;
+  for (const value of Object.values(data)) {
+    const id = findLyricsBrowseId(value);
+    if (id) return id;
+  }
+  return '';
+}
+
 async function trySource1YtmTimedLyrics(
   videoId,
   preFetchedBrowseId = '',
   signal = null,
-  titleVariants = []
+  titleVariants = [],
+  artistVariants = []
 ) {
   if (!videoId && !preFetchedBrowseId) return null;
-
   await ensureDeclarativeNetRequestRules();
+  const android = { clientName: 'ANDROID_MUSIC', clientVersion: '7.21.50', hl: 'ko', gl: 'KR' };
+  const web = {
+    clientName: 'WEB_REMIX',
+    clientVersion: `1.${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.01.00`,
+    hl: 'ko', gl: 'KR'
+  };
+  let hadError = false;
+  let plainFallback = null;
+  let visitorData = '';
+  const tried = new Set();
 
-  const androidContext = {
-    client: {
-      clientName: 'ANDROID_MUSIC',
-      clientVersion: '6.42.52',
-      androidSdkVersion: 33,
-      userAgent:
-        'com.google.android.apps.youtube.music/6.42.52 (Linux; U; Android 13; ko_KR; Pixel 7 Build/TQ3A.230805.001) gzip',
-      hl: 'ko',
-      gl: 'KR'
+  const request = async (endpoint, client, body) => {
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (visitorData) headers['X-Goog-Visitor-Id'] = visitorData;
+      const response = await fetchWithTimeout(
+        `https://music.youtube.com/youtubei/v1/${endpoint}?prettyPrint=false${client.clientName === 'ANDROID_MUSIC' ? '&ytm_mobile=1' : ''}`,
+        {
+          method: 'POST', credentials: 'omit', headers,
+          body: JSON.stringify({ context: { client: { ...client, ...(visitorData ? { visitorData } : {}) } }, ...body })
+        },
+        6500, signal
+      );
+      if (!response.ok) throw new Error(`YTM HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.error) throw new Error('YTM API error');
+      visitorData = data.responseContext?.visitorData || visitorData;
+      return data;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      hadError = true;
+      return null;
     }
   };
+  const browse = async (id, client) => {
+    const key = `${client.clientName}:${id}`;
+    if (!id || tried.has(key)) return null;
+    tried.add(key);
+    const result = extractYtmLyrics(await request('browse', client, { browseId: id }));
+    if (result?.status === 'plain') plainFallback ||= result;
+    return result?.status === 'synced' ? { ...result, videoId } : null;
+  };
 
-  try {
-    let lyricsBrowseId = preFetchedBrowseId;
-
-    if (!lyricsBrowseId && videoId) {
-      const nextRes = await fetchWithTimeout(
-        YTM_NEXT_MOBILE_URL,
-        {
-          method: 'POST',
-          credentials: 'omit',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ context: androidContext, videoId })
-        },
-        2400,
-        signal
-      );
-
-      if (nextRes.ok) {
-        const nextText = await nextRes.text();
-
-        // 자동재생 전환 직후 이전 곡의 videoId가 잘못 넘어왔는지 제목 교차 검증
-        if (Array.isArray(titleVariants) && titleVariants.length > 0) {
-          try {
-            const nextData = JSON.parse(nextText);
-            const panelVideo = findNestedKey(nextData, 'playlistPanelVideoRenderer');
-            const ytmTitle = panelVideo?.title?.runs?.[0]?.text || '';
-            if (ytmTitle) {
-              const titleSim = evaluateTitleSimilarity(ytmTitle, titleVariants);
-              const bothHaveHangul =
-                /[가-힣]/.test(ytmTitle) && titleVariants.some((v) => /[가-힣]/.test(v));
-              const bothAsciiOnly =
-                !/[^\x00-\x7F]/.test(ytmTitle) &&
-                titleVariants.every((v) => !/[^\x00-\x7F]/.test(v));
-              if (titleSim === 0 && (bothHaveHangul || bothAsciiOnly)) {
-                return null;
-              }
-            }
-          } catch (e) {}
+  // 이미 얻은 ID부터 사용한다. 모바일 next 실패가 이 경로를 막으면 안 된다.
+  if (preFetchedBrowseId) {
+    const result = await browse(preFetchedBrowseId, android);
+    if (result) return result;
+  }
+  let resolvedId = preFetchedBrowseId;
+  if (videoId) {
+    for (const client of [web, android]) {
+      const next = await request('next', client, {
+        videoId, playlistId: `RDAMVM${videoId}`, isAudioOnly: true,
+        enablePersistentPlaylistPanel: true, tunerSettingValue: 'AUTOMIX_SETTING_NORMAL',
+        watchEndpointMusicSupportedConfigs: {
+          watchEndpointMusicConfig: { hasPersistentPlaylistPanel: true, musicVideoType: 'MUSIC_VIDEO_TYPE_ATV' }
         }
-
-        const browseIdMatch = nextText.match(/"browseId"\s*:\s*"(MPLYt_[^"]+)"/);
-        if (browseIdMatch) {
-          lyricsBrowseId = browseIdMatch[1];
-        }
-      }
+      });
+      const id = findLyricsBrowseId(next);
+      if (!id) continue;
+      resolvedId = id;
+      const result = await browse(id, android);
+      if (result) return result;
+      if (plainFallback) break;
     }
-
-    if (!lyricsBrowseId) return null;
-
-    const browseRes = await fetchWithTimeout(
-      YTM_BROWSE_MOBILE_URL,
-      {
-        method: 'POST',
-        credentials: 'omit',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ context: androidContext, browseId: lyricsBrowseId })
-      },
-      2400,
-      signal
-    );
-
-    if (!browseRes.ok) return null;
-    const browseData = await browseRes.json();
-
-    const timedLyricsData = findNestedKey(browseData, 'timedLyricsData');
-    if (timedLyricsData && Array.isArray(timedLyricsData)) {
-      const lrcLines = [];
-      for (const item of timedLyricsData) {
-        const startMs = item?.cueRange?.startTimeMilliseconds;
-        const text = (item?.lyricLine || '').trim();
-        if (startMs !== undefined && text && text !== '♪') {
-          lrcLines.push(`${msToLrcTimestamp(startMs)}${text}`);
-        }
-      }
-      const lrcString = lrcLines.join('\n');
-      if (isValidSyncedLrc(lrcString)) {
-        return {
-          status: 'synced',
-          syncedLyrics: lrcString,
-          plainLyrics: null,
-          sourceStage: 'ytm_timed_lyrics'
-        };
-      }
-    }
-  } catch (err) {}
-
-  return null;
+  }
+  // 다른 녹음/MV를 검색해서 현재 트랙에 그 타임스탬프를 적용하지 않는다.
+  if (!plainFallback && resolvedId) {
+    const result = await browse(resolvedId, web);
+    if (result) return result;
+  }
+  if (plainFallback) return { ...plainFallback, videoId };
+  return hadError ? { status: 'error', sourceStage: 'ytm_timed_lyrics' } : null;
 }
 
 /* ==========================================================================
- * [Source 2] 알송(Alsong) 국내 음원 실시간 싱크 가사 SOAP API (병렬 2쿼리)
+ * [Source 2] 알송(Alsong) 국내 음원 실시간 싱크 가사 SOAP API (병렬 다중 쿼리 + 엄격 검증)
  * ========================================================================== */
 
 function escapeXml(str = '') {
@@ -1112,22 +1140,21 @@ async function queryAlsongSoapSingle(title, artist, signal) {
   </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>`;
 
-  try {
-    const res = await fetchWithTimeout(
-      ALSONG_HTTPS_URL,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/soap+xml; charset=utf-8',
-          'SOAPAction': 'ALSongWebServer/GetResembleLyric2'
-        },
-        body: soapBody
-      },
-      2200,
-      signal
-    );
-    if (res.ok) return await res.text();
-  } catch (e) {}
+  const reqInit = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/soap+xml; charset=utf-8',
+      'SOAPAction': 'ALSongWebServer/GetResembleLyric2'
+    },
+    body: soapBody
+  };
+
+  for (const url of [ALSONG_HTTPS_URL, ALSONG_HTTP_URL]) {
+    try {
+      const res = await fetchWithTimeout(url, reqInit, 2200, signal);
+      if (res.ok) return await res.text();
+    } catch (e) {}
+  }
 
   return null;
 }
@@ -1136,17 +1163,29 @@ async function trySource2AlsongLyrics(titleVariants, artistVariants, langProfile
   const primaryTitle = titleVariants[0];
   if (!primaryTitle) return null;
 
-  const pairs = [];
-  if (artistVariants[0]) pairs.push({ title: primaryTitle, artist: artistVariants[0] });
-  if (artistVariants[1]) pairs.push({ title: primaryTitle, artist: artistVariants[1] });
-  pairs.push({ title: primaryTitle, artist: '' });
+  const pairMap = new Map();
+  const addPair = (t, a) => {
+    if (!t) return;
+    const key = `${t}:::${a || ''}`;
+    if (!pairMap.has(key)) {
+      pairMap.set(key, { title: t, artist: a || '' });
+    }
+  };
 
-  // 직렬 루프 대신 상위 쿼리를 동시에 병렬 실행!
+  if (artistVariants[0]) addPair(primaryTitle, artistVariants[0]);
+  if (artistVariants[1]) addPair(primaryTitle, artistVariants[1]);
+  if (titleVariants[1] && artistVariants[0]) addPair(titleVariants[1], artistVariants[0]);
+  // 아티스트 표기가 알송 DB와 미세하게 다른 곡을 위해 제목 단독 쿼리도 함께 병렬 실행하되,
+  // 결과 채택 시에는 반드시 artistSim >= 1을 통과한 곡만 허용!
+  addPair(primaryTitle, '');
+
+  const pairs = [...pairMap.values()].slice(0, 4);
+
   const xmlResults = await Promise.all(
-    pairs.slice(0, 2).map((p) => queryAlsongSoapSingle(p.title, p.artist, signal))
+    pairs.map((p) => queryAlsongSoapSingle(p.title, p.artist, signal))
   );
 
-  let bestFallbackExactTitle = null;
+  const scoredCandidates = [];
 
   for (const xmlText of xmlResults) {
     if (!xmlText) continue;
@@ -1171,7 +1210,9 @@ async function trySource2AlsongLyrics(titleVariants, artistVariants, langProfile
       const titleSim = evaluateTitleSimilarity(itemTitle, titleVariants);
       const artistSim = evaluateArtistSimilarity(itemArtist, artistVariants);
 
-      if (titleSim === 0) continue;
+      // [핵심 버그 수정] 알송에서 아티스트가 일치하지 않는 동명이곡(artistSim === 0)을 반환하면
+      // 아예 다른 가수의 노래 가사가 나오는 문제가 발생하므로, 반드시 제목과 아티스트가 모두 매칭되어야만 채택!
+      if (titleSim === 0 || artistSim === 0) continue;
 
       const rawLyric = decodeXmlEntities(lyricMatch[1])
         .replace(/<br\s*\/?>/gi, '\n')
@@ -1180,26 +1221,24 @@ async function trySource2AlsongLyrics(titleVariants, artistVariants, langProfile
       const validatedLrc = validateAndCleanLyricsLanguage(rawLyric, langProfile, 'alsong_lrc');
       if (!validatedLrc) continue;
 
-      const resultObj = {
-        status: 'synced',
-        syncedLyrics: validatedLrc,
-        plainLyrics: null,
-        trackName: itemTitle,
-        artistName: itemArtist,
-        sourceStage: 'alsong_lrc'
-      };
-
-      if (titleSim >= 1 && artistSim >= 1) {
-        return resultObj;
-      }
-
-      if (titleSim === 2 && !bestFallbackExactTitle) {
-        bestFallbackExactTitle = resultObj;
-      }
+      const score = titleSim * 50 + artistSim * 50;
+      scoredCandidates.push({
+        score,
+        resultObj: {
+          status: 'synced',
+          syncedLyrics: validatedLrc,
+          plainLyrics: null,
+          trackName: itemTitle,
+          artistName: itemArtist,
+          sourceStage: 'alsong_lrc'
+        }
+      });
     }
   }
 
-  return bestFallbackExactTitle;
+  if (scoredCandidates.length === 0) return null;
+  scoredCandidates.sort((a, b) => b.score - a.score);
+  return scoredCandidates[0].resultObj;
 }
 
 function decodeBase64Utf8(base64Str) {
@@ -1278,12 +1317,19 @@ async function searchNetEaseSingleQuery(
       const hasDur = targetDurSec > 0 && songDurSec > 0;
       const durDiff = hasDur ? Math.abs(songDurSec - targetDurSec) : 0;
 
-      // [중화권 서버 엄격 매칭] 아티스트가 전혀 일치하지 않는 동명이곡(artistSim === 0)은
-      // 제목 완전 일치(titleSim === 2) + 길이 오차 1.5초 이내인 경우에만 예외적으로 후보에 올리고 나머지는 즉시 차단!
-      if (artistSim === 0 && !(titleSim === 2 && hasDur && durDiff <= 1.5)) {
+      // [핵심 버그 수정]
+      // 1) 제목 유사도가 0인 곡(titleSim === 0)은 같은 가수의 다른 곡이 길이만 비슷한 경우이므로 무조건 차단!
+      if (titleSim === 0) {
         continue;
       }
-      if (titleSim === 0 && !(artistSim >= 1 && hasDur && durDiff <= 3.0)) {
+      // 2) 길이 오차가 7초를 초과하는 다른 버전/다른 곡은 즉시 차단!
+      if (hasDur && durDiff > 7.0) {
+        continue;
+      }
+      // 3) 아티스트가 전혀 일치하지 않는 경우(artistSim === 0)는
+      //    5글자 이상 긴 고유 제목 완전 일치(titleSim === 2) + 길이 오차 1.5초 이내일 때만 예외 허용!
+      const normPrimaryLen = normalizeWithoutBrackets(titleVariants[0] || '').length;
+      if (artistSim === 0 && !(titleSim === 2 && hasDur && durDiff <= 1.5 && normPrimaryLen >= 5)) {
         continue;
       }
 
@@ -1291,11 +1337,11 @@ async function searchNetEaseSingleQuery(
       if (hasDur) {
         if (durDiff <= 2.5) score += 45;
         else if (durDiff <= 5) score += 25;
-        else if (durDiff <= 12) score += 8;
-        else score -= 30;
+        else if (durDiff <= 7) score += 8;
+        else score -= 40;
       }
 
-      if (score >= 55) {
+      if (score >= 60) {
         scoredSongs.push({ song, score });
       }
     }
@@ -1303,8 +1349,8 @@ async function searchNetEaseSingleQuery(
     scoredSongs.sort((a, b) => b.score - a.score);
     if (scoredSongs.length === 0) return null;
 
-    // 1순위 후보가 중국어 번역본/커버곡일 수 있으므로 상위 2개 후보까지 검사하여 원어 검증을 통과하는 첫 후보 채택
-    for (const candidate of scoredSongs.slice(0, 2)) {
+    // 상위 3개 후보까지 검사하여 원어 검증을 통과하는 첫 후보 채택
+    for (const candidate of scoredSongs.slice(0, 3)) {
       const lyricParams = new URLSearchParams({
         os: 'pc',
         id: String(candidate.song.id),
@@ -1357,10 +1403,12 @@ async function trySource4NetEaseLyrics(
   const targetDurSec = Number(duration) || 0;
   const queries = [];
   if (artistVariants[0]) queries.push(`${titleVariants[0]} ${artistVariants[0]}`.trim());
-  if (titleVariants[1]) queries.push(`${titleVariants[1]} ${artistVariants[0] || ''}`.trim());
+  if (titleVariants[1]) {
+    queries.push(`${titleVariants[1]} ${artistVariants[1] || artistVariants[0] || ''}`.trim());
+  }
   queries.push(titleVariants[0]);
 
-  const uniqueQueries = [...new Set(queries)].slice(0, 2);
+  const uniqueQueries = [...new Set(queries.filter(Boolean))].slice(0, 3);
   const results = await Promise.all(
     uniqueQueries.map((q) =>
       searchNetEaseSingleQuery(q, titleVariants, artistVariants, targetDurSec, langProfile, signal)
@@ -1434,10 +1482,15 @@ async function searchQQSingleQuery(
       const hasDur = targetDurSec > 0 && songDurSec > 0;
       const durDiff = hasDur ? Math.abs(songDurSec - targetDurSec) : 0;
 
-      if (artistSim === 0 && !(titleSim === 2 && hasDur && durDiff <= 1.5)) {
+      // [핵심 버그 수정] 제목 불일치(titleSim === 0) 및 길이 오차 초과 즉시 차단!
+      if (titleSim === 0) {
         continue;
       }
-      if (titleSim === 0 && !(artistSim >= 1 && hasDur && durDiff <= 3.0)) {
+      if (hasDur && durDiff > 7.0) {
+        continue;
+      }
+      const normPrimaryLen = normalizeWithoutBrackets(titleVariants[0] || '').length;
+      if (artistSim === 0 && !(titleSim === 2 && hasDur && durDiff <= 1.5 && normPrimaryLen >= 5)) {
         continue;
       }
 
@@ -1445,11 +1498,11 @@ async function searchQQSingleQuery(
       if (hasDur) {
         if (durDiff <= 2.5) score += 45;
         else if (durDiff <= 5) score += 25;
-        else if (durDiff <= 12) score += 8;
-        else score -= 30;
+        else if (durDiff <= 7) score += 8;
+        else score -= 40;
       }
 
-      if (score >= 55) {
+      if (score >= 60) {
         scored.push({ songMid, songName: song.name || song.title, score });
       }
     }
@@ -1457,7 +1510,7 @@ async function searchQQSingleQuery(
     scored.sort((a, b) => b.score - a.score);
     if (scored.length === 0) return null;
 
-    for (const candidate of scored.slice(0, 2)) {
+    for (const candidate of scored.slice(0, 3)) {
       const lyricParams = new URLSearchParams({
         songmid: candidate.songMid,
         g_tk: '5381',
@@ -1514,9 +1567,12 @@ async function trySource5QQMusicLyrics(
   const targetDurSec = Number(duration) || 0;
   const queries = [];
   if (artistVariants[0]) queries.push(`${titleVariants[0]} ${artistVariants[0]}`.trim());
+  if (titleVariants[1]) {
+    queries.push(`${titleVariants[1]} ${artistVariants[1] || artistVariants[0] || ''}`.trim());
+  }
   queries.push(titleVariants[0]);
 
-  const uniqueQueries = [...new Set(queries)].slice(0, 2);
+  const uniqueQueries = [...new Set(queries.filter(Boolean))].slice(0, 3);
   const results = await Promise.all(
     uniqueQueries.map((q) =>
       searchQQSingleQuery(q, titleVariants, artistVariants, targetDurSec, langProfile, signal)
@@ -1527,7 +1583,7 @@ async function trySource5QQMusicLyrics(
 }
 
 /* ==========================================================================
- * [Source 5] LRCLIB 병렬 검색 파이프라인 (+ 언어 검증 필터)
+ * [Source 5] LRCLIB 병렬 검색 파이프라인 (+ 언어 검증 필터 + 실시간 싱크 최우선 채택)
  * ========================================================================== */
 
 function formatLrclibResult(item, sourceStage, langProfile = null) {
@@ -1572,6 +1628,7 @@ function pickBestLrclibMatch(items, context) {
 
   const { titleVariants = [], artistVariants = [], duration = 0, langProfile = null } = context;
   const targetDuration = Number(duration) || 0;
+  const normPrimaryLen = normalizeWithoutBrackets(titleVariants[0] || '').length;
 
   const validCandidates = items.filter(
     (item) =>
@@ -1582,7 +1639,9 @@ function pickBestLrclibMatch(items, context) {
 
   if (validCandidates.length === 0) return null;
 
-  const scored = [];
+  const syncedScored = [];
+  const plainScored = [];
+
   for (const item of validCandidates) {
     const validatedSynced =
       typeof item.syncedLyrics === 'string'
@@ -1595,31 +1654,52 @@ function pickBestLrclibMatch(items, context) {
     const hasDur = targetDuration > 0 && itemDur > 0;
     const durDiff = hasDur ? Math.abs(itemDur - targetDuration) : 0;
 
+    // 1. 제목 불일치 즉시 제외
     if (titleSim === 0) continue;
-    if (titleSim === 1 && artistSim === 0 && (!hasDur || durDiff > 3.0)) continue;
-    if (titleSim === 2 && artistSim === 0 && hasDur && durDiff > 12.0) continue;
+
+    // 2. 길이 오차 8초 초과 즉시 제외
+    if (hasDur && durDiff > 8.0) continue;
+
+    // 3. 아티스트가 전혀 일치하지 않는 동명이곡(artistSim === 0) 차단:
+    //    4글자 이상의 고유 제목이 완전 일치(titleSim === 2)하고 곡 길이가 2.0초 이내로 일치할 때만 예외 허용!
+    if (artistSim === 0 && !(titleSim === 2 && hasDur && durDiff <= 2.0 && normPrimaryLen >= 4)) {
+      continue;
+    }
 
     let score = 0;
-    if (hasSynced) score += 80;
-    if (titleSim === 2) score += 50;
-    else if (titleSim === 1) score += 25;
+    if (titleSim === 2) score += 55;
+    else if (titleSim === 1) score += 30;
 
-    if (artistSim === 2) score += 50;
-    else if (artistSim === 1) score += 30;
+    if (artistSim === 2) score += 55;
+    else if (artistSim === 1) score += 35;
 
     if (hasDur) {
       if (durDiff <= 2) score += 45;
       else if (durDiff <= 5) score += 30;
-      else if (durDiff <= 10) score += 12;
-      else score -= Math.min(45, durDiff);
+      else if (durDiff <= 8) score += 12;
     }
 
-    scored.push({ item, score, hasSynced });
+    if (score < 60) continue;
+
+    if (hasSynced) {
+      syncedScored.push({ item, score });
+    } else {
+      plainScored.push({ item, score });
+    }
   }
 
-  if (scored.length === 0) return null;
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0].score >= 50 ? scored[0].item : null;
+  // [핵심 버그 수정] 실시간 싱크 가사(syncedLyrics)가 있는 후보를 무조건 일반 가사(plainLyrics)보다 최우선 채택!
+  if (syncedScored.length > 0) {
+    syncedScored.sort((a, b) => b.score - a.score);
+    return syncedScored[0].item;
+  }
+
+  if (plainScored.length > 0) {
+    plainScored.sort((a, b) => b.score - a.score);
+    return plainScored[0].item;
+  }
+
+  return null;
 }
 
 async function trySource6LrclibPipeline(
@@ -1633,14 +1713,36 @@ async function trySource6LrclibPipeline(
   if (titleVariants.length === 0) return null;
 
   const paramList = [];
-  for (const t of titleVariants.slice(0, 2)) {
-    for (const a of artistVariants.slice(0, 2)) {
-      paramList.push(new URLSearchParams({ track_name: t, artist_name: a }));
+  const seenParams = new Set();
+  const pushParams = (obj) => {
+    const sp = new URLSearchParams(obj);
+    const key = sp.toString();
+    if (!seenParams.has(key)) {
+      seenParams.add(key);
+      paramList.push(sp);
     }
-    paramList.push(new URLSearchParams({ q: `${t} ${artistVariants[0] || ''}`.trim() }));
+  };
+
+  // 한글 원제(titleVariants[0])와 영문 제목(titleVariants[1])이 모두 상위 병렬 쿼리에 포함되도록 교차 배치!
+  if (titleVariants[0] && artistVariants[0]) {
+    pushParams({ track_name: titleVariants[0], artist_name: artistVariants[0] });
+  }
+  if (titleVariants[1] && (artistVariants[1] || artistVariants[0])) {
+    pushParams({
+      track_name: titleVariants[1],
+      artist_name: artistVariants[1] || artistVariants[0]
+    });
+  }
+  if (titleVariants[0] && artistVariants[1]) {
+    pushParams({ track_name: titleVariants[0], artist_name: artistVariants[1] });
+  }
+  if (titleVariants[0]) {
+    pushParams({ q: `${titleVariants[0]} ${artistVariants[0] || ''}`.trim() });
+  }
+  if (titleVariants[1]) {
+    pushParams({ q: `${titleVariants[1]} ${artistVariants[1] || artistVariants[0] || ''}`.trim() });
   }
 
-  // 상위 3개 핵심 쿼리를 직렬 대기 없이 동시에 병렬 호출!
   const fetchOne = async (params) => {
     try {
       const res = await fetchWithTimeout(
@@ -1666,7 +1768,9 @@ async function trySource6LrclibPipeline(
     return null;
   };
 
-  const results = await Promise.all(paramList.slice(0, 3).map(fetchOne));
+  // 제목만으로도 조회하되 후보 선택 시 제목·아티스트·길이는 계속 검증한다.
+  for (const title of titleVariants.slice(0, 3)) pushParams({ track_name: title });
+  const results = await Promise.all(paramList.map(fetchOne));
   return results.find((r) => r && r.status === 'synced') || null;
 }
 
@@ -1699,7 +1803,13 @@ async function fetchLyricsFromPreferredSource(meta, titleVariants, artistVariant
 
   let res = null;
   if (source === 'ytm') {
-    res = await trySource1YtmTimedLyrics(meta.videoId, meta.lyricsBrowseId, signal);
+    res = await trySource1YtmTimedLyrics(
+      meta.videoId,
+      meta.lyricsBrowseId,
+      signal,
+      titleVariants,
+      artistVariants
+    );
   } else if (source === 'alsong') {
     res = await trySource2AlsongLyrics(titleVariants, artistVariants, manualProfile, signal);
   } else if (source === 'lrclib') {
@@ -1731,6 +1841,8 @@ async function fetchLyricsFromPreferredSource(meta, titleVariants, artistVariant
       signal
     );
   }
+
+  if (res?.status === 'error') return res;
 
   if (res && (res.status === 'synced' || res.status === 'plain')) {
     setSessionCache(canonicalKey, res);
@@ -1784,16 +1896,37 @@ async function fetchLyricsPipeline(meta) {
     persistentLyricsCache.delete(canonicalKey);
   }
 
+  // 캐시 엔트리가 과거 잘못된 매칭(다른 곡 제목 또는 알송 동명이곡 타 가수)으로 저장되었는지 교차 검증
+  const isCachedTrackMismatched = (entry) => {
+    if (!entry) return true;
+    if (
+      entry.sourceStage === 'ytm_timed_lyrics' &&
+      entry.videoId &&
+      meta.videoId &&
+      entry.videoId !== meta.videoId
+    ) {
+      return true;
+    }
+    if (entry.sourceStage !== 'ytm_timed_lyrics' && entry.trackName) {
+      if (evaluateTitleSimilarity(entry.trackName, titleVariants) === 0) {
+        return true;
+      }
+      if (
+        entry.sourceStage === 'alsong_lrc' &&
+        entry.artistName &&
+        evaluateArtistSimilarity(entry.artistName, artistVariants) === 0
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   // 1. 영구 로컬 캐시(좋아요/저장목록 곡) 또는 현재 세션 캐시(프리페칭 포함) 즉시 히트 (0.01초!)
   if (isPersistentCacheEnabled && persistentLyricsCache.has(canonicalKey)) {
     const pCached = persistentLyricsCache.get(canonicalKey);
-    const isStaleYtmVidMismatch =
-      pCached.sourceStage === 'ytm_timed_lyrics' &&
-      pCached.videoId &&
-      meta.videoId &&
-      pCached.videoId !== meta.videoId;
 
-    if (!isStaleYtmVidMismatch) {
+    if (!isCachedTrackMismatched(pCached)) {
       const verified = validateAndCleanLyricsLanguage(
         pCached.syncedLyrics,
         langProfile,
@@ -1807,17 +1940,14 @@ async function fetchLyricsPipeline(meta) {
       }
     }
     persistentLyricsCache.delete(canonicalKey);
+    sessionLyricsCache.delete(canonicalKey);
   }
 
   if (sessionLyricsCache.has(canonicalKey)) {
     const cached = sessionLyricsCache.get(canonicalKey);
-    const isStaleYtmVidMismatch =
-      cached.sourceStage === 'ytm_timed_lyrics' &&
-      cached.videoId &&
-      meta.videoId &&
-      cached.videoId !== meta.videoId;
+    const mismatched = isCachedTrackMismatched(cached);
 
-    if (cached.status === 'synced' && !isStaleYtmVidMismatch) {
+    if (cached.status === 'synced' && !mismatched) {
       const verified = validateAndCleanLyricsLanguage(
         cached.syncedLyrics,
         langProfile,
@@ -1831,7 +1961,7 @@ async function fetchLyricsPipeline(meta) {
         return { ...cleanCached, fromCache: true };
       }
       sessionLyricsCache.delete(canonicalKey);
-    } else if (isStaleYtmVidMismatch) {
+    } else if (mismatched) {
       sessionLyricsCache.delete(canonicalKey);
     } else if (meta.isPrefetch) {
       return { ...cached, fromCache: true };
@@ -1853,7 +1983,16 @@ async function fetchLyricsPipeline(meta) {
       // 1군(Tier 1 - 원어 신뢰도 최상): YTM TimedLyrics, LRCLIB, 알송(Alsong)
       const tier1List = [
         requireSyncedResult(
-          trySource1YtmTimedLyrics(meta.videoId, meta.lyricsBrowseId, signal, titleVariants)
+          trySource1YtmTimedLyrics(
+            meta.videoId,
+            meta.lyricsBrowseId,
+            signal,
+            titleVariants,
+            artistVariants
+          ).then((result) => {
+            if (result?.status === 'plain') plainCollector.push(result);
+            return result;
+          })
         ),
         requireSyncedResult(
           trySource6LrclibPipeline(
@@ -1940,6 +2079,13 @@ async function fetchLyricsPipeline(meta) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !message.type) return false;
+
+  if (message.type === 'PARSE_YTM_LYRICS') {
+    if (!sender.url?.startsWith('https://music.youtube.com/')) return false;
+    const result = extractYtmLyrics(message.payload?.browseData);
+    sendResponse({ ok: true, data: result ? { ...result, videoId: message.payload?.videoId || '' } : null });
+    return false;
+  }
 
   if (message.type === 'FETCH_LYRICS' || message.type === 'PREFETCH_LYRICS') {
     const meta = message.payload || {};

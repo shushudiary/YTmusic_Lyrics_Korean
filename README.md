@@ -1,5 +1,3 @@
-# 이 확장 프로그램은 AI을 통해 바이브 코딩 됨.
-
 # 🎵 YTmusic_Lyrics_Korean
 
 <p align="center">
@@ -31,7 +29,7 @@
 
 ### 2. ⚡ 5대 멀티 소스 선착순 레이싱 파이프라인
 가사 검색 지연을 없애기 위해 5대 가사 소스를 병렬로 동시 호출하며, 가장 먼저 유효한 싱크 가사를 반환한 소스를 0.2~0.4초 만에 즉시 채택합니다.
-- **YouTube Music 공식 모바일 TimedLyrics** (무결점 실시간 가사)
+- **YouTube Music 공식 TimedLyrics** (타임스탬프가 제공되는 곡 지원)
 - **알송 (Alsong)** (K-Pop/국내 음원 특화)
 - **LRCLIB** (글로벌 오픈소스 LRC 데이터베이스)
 - **NetEase Cloud Music (왕이윈)** (J-Pop, 글로벌 음원 보완)
@@ -58,6 +56,7 @@
 YTmusic_Lyrics_Korean/
 ├── manifest.json       # Manifest V3 설정 및 권한 명시
 ├── background.js      # 가사 API 통신, DNR 헤더 수정, 캐싱 및 선착순 레이싱
+├── page-bridge.js     # 현재 트랙 시간·ID 및 한 번만 실행하는 재생 위치 이동
 ├── content.js         # YTM DOM 감지, 가사 렌더링, 전체화면 모달, 우클릭 메뉴
 ├── styles.css         # Apple Music 스타일 UI, GPU 애니메이션, 글래스모피즘
 ├── popup.html         # 설정 팝업 UI
@@ -74,7 +73,7 @@ YTmusic_Lyrics_Korean/
 
 1. 저장소를 클론하거나 ZIP 파일로 다운로드 후 압축을 풉니다.
    ```bash
-   git clone https://github.com/shushudiary/YTmusic_Lyrics_Korean.git
+   git clone https://github.com/your-username/YTmusic_Lyrics_Korean.git
    ```
 2. Chrome 또는 Chromium 기반 브라우저(Edge, Whale, Brave 등)를 열고 주소창에 `chrome://extensions`를 입력합니다.
 3. 우측 상단의 **개발자 모드(Developer mode)** 토글을 활성화합니다.
@@ -110,3 +109,21 @@ YTmusic_Lyrics_Korean/
 ## 📄 라이선스 (License)
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+
+## 수정본 적용 및 검증
+
+확장 프로그램 관리 화면에서 확장 프로그램을 새로고침한 뒤, 열려 있는 YouTube Music 탭도 새로고침하세요. 페이지 재생 제어 브리지와 가사 요청 코드가 함께 갱신되어야 합니다.
+
+- 가사 클릭과 재생바 이동은 플레이어 명령이 처리되면 영상 시간을 다시 변경하지 않습니다.
+- 같은 곡에서 제공자를 수동 선택하면 메타데이터 재검색에도 선택을 유지합니다. 다른 제공자의 이전 응답은 화면을 덮어쓰지 않습니다.
+- 공식 가사는 현재 트랙의 가사 ID를 모바일 형식으로 조회하며, 현재 탭의 로그인 세션을 이용하는 조회도 지원합니다. 다른 음원이나 MV의 시간을 대신 적용하지 않습니다.
+- 제공자가 시간 정보를 주지 않으면 일반 가사로 표시합니다. 모든 제공자가 모든 곡의 실시간 가사를 보유하는 것은 아닙니다.
+
+개발 검증(Node.js 22 이상, 추가 패키지 없음):
+
+```bash
+node --test tests/regression.test.cjs
+```
+
+테스트는 재생 위치 중복 이동, 연속 탐색, 자동재생 시간 오프셋, 제공자 전환 경쟁, 공식 가사 응답 해석 및 로그인 세션 유지 경로를 모의 환경에서 검사합니다. 실제 Chrome에서 로그인한 계정별 공식 가사 제공 여부는 별도 확인이 필요합니다.
